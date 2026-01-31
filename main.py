@@ -21,9 +21,9 @@ CONFIG = {
     'OUTPUT_CSV': 'enriched_sellers.csv', # Name of output CSV file
     
     # Processing Parameters
-    'START_FROM_LINE': None,  # Start from specific RECORD number (None = start from beginning)
+    'START_FROM_LINE': 281,  # Start from specific RECORD number (None = start from beginning)
                               # Example: 11 means start from the 11th record (line 12 in file)
-    'MAX_RECORDS': 80,      # Maximum records to process (None = process all)
+    'MAX_RECORDS': 200,      # Maximum records to process (None = process all)
                               # Example: 50 means process only 50 records
     
     # API Configuration
