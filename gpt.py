@@ -17,11 +17,11 @@ from openai import OpenAI
 
 CONFIG = {
     # Input/Output Files
-    'INPUT_CSV': 'enriched_sellers.csv',
-    'OUTPUT_CSV': 'final_sellers.csv',
+    'INPUT_CSV': 'NEW enriched_sellers.csv',
+    'OUTPUT_CSV': 'NEW final_sellers.csv',
 
     # Processing Parameters
-    'START_FROM_LINE': 405,   # 1-indexed record number (None = from beginning)
+    'START_FROM_LINE': 204,   # 1-indexed record number (None = from beginning)
     'MAX_RECORDS': None,       # Max records to process (None = all)
 
     # Batch Settings

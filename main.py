@@ -17,13 +17,13 @@ from datetime import datetime
 
 CONFIG = {
     # Input/Output Files
-    'INPUT_CSV': 'Jan 2026 - Not Reached Yet.csv',           # Name of input CSV file
-    'OUTPUT_CSV': 'enriched_sellers.csv', # Name of output CSV file
+    'INPUT_CSV': 'NEW Jan 2026 - Not Reached Yet.csv',           # Name of input CSV file
+    'OUTPUT_CSV': 'NEW enriched_sellers.csv', # Name of output CSV file
     
     # Processing Parameters
-    'START_FROM_LINE': 281,  # Start from specific RECORD number (None = start from beginning)
+    'START_FROM_LINE': 633,  # Start from specific RECORD number (None = start from beginning)
                               # Example: 11 means start from the 11th record (line 12 in file)
-    'MAX_RECORDS': 200,      # Maximum records to process (None = process all)
+    'MAX_RECORDS': None,      # Maximum records to process (None = process all)
                               # Example: 50 means process only 50 records
     
     # API Configuration
