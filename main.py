@@ -4,6 +4,7 @@ Fetches top products for sellers and enriches CSV with product details
 """
 
 import csv
+import re
 import requests
 import time
 from pathlib import Path
@@ -17,11 +18,11 @@ from datetime import datetime
 
 CONFIG = {
     # Input/Output Files
-    'INPUT_CSV': 'NEW Jan 2026 - Not Reached Yet.csv',           # Name of input CSV file
-    'OUTPUT_CSV': 'NEW enriched_sellers.csv', # Name of output CSV file
+    'INPUT_CSV': 'Bunch 3 - Verified.csv',           # Name of input CSV file
+    'OUTPUT_CSV': 'Bunch 3 - Amazon1.csv', # Name of output CSV file
     
     # Processing Parameters
-    'START_FROM_LINE': 633,  # Start from specific RECORD number (None = start from beginning)
+    'START_FROM_LINE': 301,  # Start from specific RECORD number (None = start from beginning)
                               # Example: 11 means start from the 11th record (line 12 in file)
     'MAX_RECORDS': None,      # Maximum records to process (None = process all)
                               # Example: 50 means process only 50 records
@@ -41,6 +42,25 @@ CONFIG = {
     'HTTP': 'true',
     'DEVICE': 'desktop',
     'PAGE': '1',
+
+    # -------------------------------------------------------------------------
+    # CSV Column Mapping - adapt to your CSV structure (order or column names)
+    # -------------------------------------------------------------------------
+    # Script needs: (1) Seller ID for API calls, (2) Seller Name for console output.
+    # List column names to try in order; first non-empty match is used.
+    # For Seller ID: if the cell looks like an Amazon URL (e.g. ...?seller=XXX or .../sp?seller=XXX),
+    #   the script will extract the seller ID automatically.
+    #
+    # Example - standard structure (Seller ID, Seller Name columns):
+    #   'COLUMN_SELLER_ID': ['Seller ID', 'Seller URL'],
+    #   'COLUMN_SELLER_NAME': ['Seller Name'],
+    #
+    # Example - Bunch/Verified structure (Seller URL only, no Seller ID column):
+    #   'COLUMN_SELLER_ID': ['Seller URL', 'Seller ID'],
+    #   'COLUMN_SELLER_NAME': ['Seller Name'],
+    #
+    'COLUMN_SELLER_ID': ['Seller ID', 'Seller URL'],
+    'COLUMN_SELLER_NAME': ['Seller Name'],
 }
 
 # ============================================================================
@@ -55,6 +75,47 @@ if not API_KEY:
     raise ValueError("API_KEY not found in .env file!")
 
 BASE_URL = "https://ecom.webscrapingapi.com/v1"
+
+# Regex to extract seller ID from Amazon URLs (e.g. ?seller=A1VXZR1R80P8X9 or &seller=...)
+SELLER_ID_FROM_URL_RE = re.compile(r'[?&]seller=([A-Z0-9]+)', re.IGNORECASE)
+
+
+def extract_seller_id_from_value(value):
+    """
+    Get seller ID from a cell value: either the raw value (if it looks like an ID)
+    or extract from an Amazon URL containing ?seller=XXX or &seller=XXX.
+    """
+    if not value or not isinstance(value, str):
+        return ''
+    s = value.strip()
+    if not s:
+        return ''
+    # URL: extract from query param
+    match = SELLER_ID_FROM_URL_RE.search(s)
+    if match:
+        return match.group(1).strip()
+    # Already looks like a seller ID (alphanumeric, typical length)
+    if re.match(r'^[A-Z0-9]{10,20}$', s, re.IGNORECASE):
+        return s
+    return s
+
+
+def get_seller_id_from_row(row):
+    """Resolve seller ID from a CSV row using COLUMN_SELLER_ID mapping."""
+    for col in CONFIG.get('COLUMN_SELLER_ID', ['Seller ID', 'Seller URL']):
+        val = (row.get(col) or '').strip()
+        if val:
+            return extract_seller_id_from_value(val)
+    return ''
+
+
+def get_seller_name_from_row(row):
+    """Resolve seller name from a CSV row using COLUMN_SELLER_NAME mapping (for display only)."""
+    for col in CONFIG.get('COLUMN_SELLER_NAME', ['Seller Name']):
+        val = (row.get(col) or '').strip()
+        if val:
+            return val
+    return 'N/A'
 
 
 def build_seller_products_url(seller_id):
@@ -138,7 +199,7 @@ def fetch_product_details(product_id):
 
 def process_seller(seller_row):
     """Process a single seller and return enriched data"""
-    seller_id = seller_row.get('Seller ID', '').strip()
+    seller_id = get_seller_id_from_row(seller_row)
     
     if not seller_id:
         return None
@@ -146,7 +207,7 @@ def process_seller(seller_row):
     start_time = time.time()
     
     print(f"\n{'='*80}")
-    print(f"🔍 Processing Seller: {seller_row.get('Seller Name', 'N/A')}")
+    print(f"🔍 Processing Seller: {get_seller_name_from_row(seller_row)}")
     print(f"   Seller ID: {seller_id}")
     
     # Step 1: Get top product from seller
@@ -202,14 +263,19 @@ def process_seller(seller_row):
 
 
 def get_existing_seller_ids(output_file):
-    """Get set of seller IDs that are already in the output file"""
+    """Get set of seller IDs that are already in the output file (uses same column mapping)."""
     if not os.path.exists(output_file):
         return set()
     
     try:
+        seen = set()
         with open(output_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            return {row.get('Seller ID', '').strip() for row in reader if row.get('Seller ID', '').strip()}
+            for row in reader:
+                sid = get_seller_id_from_row(row)
+                if sid:
+                    seen.add(sid)
+        return seen
     except Exception as e:
         print(f"⚠️  Warning: Could not read existing output file: {e}")
         return set()
@@ -310,7 +376,7 @@ def main():
     print(f"{'='*80}\n")
     
     for idx, row in enumerate(rows_to_process, 1):
-        seller_id = row.get('Seller ID', '').strip()
+        seller_id = get_seller_id_from_row(row)
         
         print(f"\n📍 Progress: {idx}/{actual_count} | Record #{start_idx + idx}")
         

@@ -6,6 +6,7 @@ and visual feature suggestions using GPT for email campaigns.
 
 import csv
 import os
+import re
 import time
 import json
 from dotenv import load_dotenv
@@ -17,11 +18,12 @@ from openai import OpenAI
 
 CONFIG = {
     # Input/Output Files
-    'INPUT_CSV': 'NEW enriched_sellers.csv',
-    'OUTPUT_CSV': 'NEW final_sellers.csv',
+    # Note: CSV files are stored in the "csv" subfolder
+    'INPUT_CSV': 'Bunch 3 - Amazon.csv',
+    'OUTPUT_CSV': 'Bunch 3 - Final.csv',
 
     # Processing Parameters
-    'START_FROM_LINE': 204,   # 1-indexed record number (None = from beginning)
+    'START_FROM_LINE': 301,   # 1-indexed record number (None = from beginning)
     'MAX_RECORDS': None,       # Max records to process (None = all)
 
     # Batch Settings
@@ -39,6 +41,17 @@ CONFIG = {
 
     # Rate Limiting
     'WAIT_BETWEEN_BATCHES': 2,  # Seconds between API calls
+
+    # -------------------------------------------------------------------------
+    # CSV Column Mapping - adapt to your CSV structure (order or column names)
+    # -------------------------------------------------------------------------
+    # List column names to try in order; first non-empty match is used.
+    # For Seller ID: if the cell looks like an Amazon URL (e.g. ...?seller=XXX),
+    #   the script will extract the seller ID automatically.
+    'COLUMN_SELLER_ID': ['Seller ID', 'Seller URL'],
+    'COLUMN_SELLER_NAME': ['Seller Name'],
+    'COLUMN_PRODUCT_NAME': ['Product Name'],
+    'COLUMN_PRODUCT_DESCRIPTION': ['Product Description'],
 }
 
 # ============================================================================
@@ -52,6 +65,60 @@ if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY not found in .env file!")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Regex to extract seller ID from Amazon URLs (e.g. ?seller=A1VXZR1R80P8X9)
+SELLER_ID_FROM_URL_RE = re.compile(r'[?&]seller=([A-Z0-9]+)', re.IGNORECASE)
+
+
+def _extract_seller_id_from_value(value):
+    """Get seller ID from a cell: raw value or extract from Amazon URL ?seller=XXX."""
+    if not value or not isinstance(value, str):
+        return ''
+    s = value.strip()
+    if not s:
+        return ''
+    match = SELLER_ID_FROM_URL_RE.search(s)
+    if match:
+        return match.group(1).strip()
+    if re.match(r'^[A-Z0-9]{10,20}$', s, re.IGNORECASE):
+        return s
+    return s
+
+
+def get_seller_id_from_row(row):
+    """Resolve seller ID from a CSV row using COLUMN_SELLER_ID mapping."""
+    for col in CONFIG.get('COLUMN_SELLER_ID', ['Seller ID', 'Seller URL']):
+        val = (row.get(col) or '').strip() if col else ''
+        if val:
+            return _extract_seller_id_from_value(val)
+    return ''
+
+
+def get_seller_name_from_row(row):
+    """Resolve seller name for display using COLUMN_SELLER_NAME mapping."""
+    for col in CONFIG.get('COLUMN_SELLER_NAME', ['Seller Name']):
+        val = (row.get(col) or '').strip() if col else ''
+        if val:
+            return val
+    return 'N/A'
+
+
+def get_product_name_from_row(row):
+    """Resolve product name from row using COLUMN_PRODUCT_NAME mapping."""
+    for col in CONFIG.get('COLUMN_PRODUCT_NAME', ['Product Name']):
+        val = (row.get(col) or '').strip() if col else ''
+        if val:
+            return val
+    return ''
+
+
+def get_product_description_from_row(row):
+    """Resolve product description from row using COLUMN_PRODUCT_DESCRIPTION mapping."""
+    for col in CONFIG.get('COLUMN_PRODUCT_DESCRIPTION', ['Product Description']):
+        val = (row.get(col) or '').strip() if col else ''
+        if val:
+            return val
+    return ''
 
 
 # ============================================================================
@@ -84,8 +151,8 @@ def build_user_prompt(batch):
     lines.append("-" * 80)
 
     for i, record in enumerate(batch, 1):
-        name = record.get('Product Name', '').strip() or 'N/A'
-        desc = record.get('Product Description', '').strip() or 'N/A'
+        name = get_product_name_from_row(record) or 'N/A'
+        desc = get_product_description_from_row(record) or 'N/A'
         lines.append(f"{i} | {name} | {desc}")
 
     lines.append("\n" + "-" * 80)
@@ -200,47 +267,46 @@ def parse_gpt_response(response_text, batch_size):
 # FILE HANDLING
 # ============================================================================
 
-INPUT_COLUMNS = [
-    'Seller ID', 'Seller Link', 'Seller Name', 'Website',
-    'Estimated Monthly Revenue', 'First Name', 'Last Name',
-    'Title', 'Email', 'Source', 'Phone Number', 'Apollo Number',
-    'Category', 'Instantly', 'Product URL', 'Product Name', 'Product Description'
-]
-
 OUTPUT_EXTRA_COLUMNS = ['Variable 1', 'Variable 2']
-OUTPUT_COLUMNS = INPUT_COLUMNS + OUTPUT_EXTRA_COLUMNS
 
 
 def get_existing_seller_ids(output_file):
-    """Read already-processed Seller IDs from output file"""
+    """Read already-processed Seller IDs from output file (uses COLUMN_SELLER_ID mapping)."""
     if not os.path.exists(output_file):
         return set()
     try:
+        seen = set()
         with open(output_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            return {row.get('Seller ID', '').strip() for row in reader if row.get('Seller ID', '').strip()}
+            for row in reader:
+                sid = get_seller_id_from_row(row)
+                if sid:
+                    seen.add(sid)
+        return seen
     except Exception as e:
         print(f"⚠️  Could not read existing output file: {e}")
         return set()
 
 
-def initialize_output_file():
-    """Create output file with headers if it doesn't exist"""
+def initialize_output_file(output_headers):
+    """Create output file with headers if it doesn't exist. output_headers = input CSV columns + Variable 1, Variable 2."""
     if not os.path.exists(CONFIG['OUTPUT_CSV']):
         with open(CONFIG['OUTPUT_CSV'], 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+            writer = csv.DictWriter(f, fieldnames=output_headers, extrasaction='ignore')
             writer.writeheader()
         print(f"   ✓ Created new output file: {CONFIG['OUTPUT_CSV']}")
     else:
         print(f"   ✓ Output file exists, will append to: {CONFIG['OUTPUT_CSV']}")
 
 
-def append_batch_to_output(rows):
-    """Append a list of enriched rows to the output CSV"""
+def append_batch_to_output(rows, output_headers):
+    """Append enriched rows to the output CSV. Uses output_headers so any CSV structure is supported."""
     with open(CONFIG['OUTPUT_CSV'], 'a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=output_headers, extrasaction='ignore')
         for row in rows:
-            writer.writerow(row)
+            # Write only keys that are in output_headers; fill missing with ''
+            ordered_row = {k: row.get(k, '') for k in output_headers}
+            writer.writerow(ordered_row)
 
 
 # ============================================================================
@@ -271,11 +337,14 @@ def main():
     try:
         with open(CONFIG['INPUT_CSV'], 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
+            input_headers = list(reader.fieldnames) if reader.fieldnames else []
             all_rows = list(reader)
     except FileNotFoundError:
         print(f"\n❌ Error: Input file '{CONFIG['INPUT_CSV']}' not found!")
         return
 
+    # Output = same columns as input + Variable 1, Variable 2 (structure-agnostic)
+    output_headers = input_headers + [c for c in OUTPUT_EXTRA_COLUMNS if c not in input_headers]
     total_rows = len(all_rows)
     print(f"\n📋 Total records in input: {total_rows}")
 
@@ -297,13 +366,13 @@ def main():
     if existing_ids:
         print(f"⏭️  Found {len(existing_ids)} already processed records in output file")
 
-    initialize_output_file()
+    initialize_output_file(output_headers)
 
     # ---- Filter out already processed ----
     pending_rows = []
     skipped_count = 0
     for row in rows_to_process:
-        sid = row.get('Seller ID', '').strip()
+        sid = get_seller_id_from_row(row)
         if sid in existing_ids:
             skipped_count += 1
         else:
@@ -346,8 +415,8 @@ def main():
 
         # Show what's in this batch
         for i, record in enumerate(batch):
-            name = record.get('Product Name', 'N/A')
-            seller = record.get('Seller Name', 'N/A')
+            name = get_product_name_from_row(record) or 'N/A'
+            seller = get_seller_name_from_row(record)
             display_name = f"{name[:55]}..." if len(name) > 55 else name
             print(f"   [{i+1}] {seller:30s} → {display_name}")
 
@@ -379,13 +448,13 @@ def main():
             enriched['Variable 2'] = var2
             enriched_rows.append(enriched)
 
-            seller = record.get('Seller Name', 'N/A')
+            seller = get_seller_name_from_row(record)
             print(f"\n   ✅ [{i+1}] {seller}")
             print(f"       Variable 1: {var1}")
             print(f"       Variable 2: {var2}")
 
         # Write to output immediately
-        append_batch_to_output(enriched_rows)
+        append_batch_to_output(enriched_rows, output_headers)
         processed += batch_size
 
         batch_elapsed = time.time() - batch_start
