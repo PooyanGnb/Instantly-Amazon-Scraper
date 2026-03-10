@@ -183,4 +183,5 @@ cython_debug/
 
 # Defined by User
 *.csv
+!Verified.csv
 *.json
