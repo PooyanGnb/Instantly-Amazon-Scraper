@@ -24,18 +24,27 @@ def override_from_env(config, env_prefix=""):
     """
     Override config dict with environment variables.
     Keys are uppercased; list values use comma-separated env (e.g. COLUMN_SELLER_ID=Seller ID,Seller URL).
+
+    Only overrides when the env var is present in .env (and not commented). If the var is missing
+    or commented out, CONFIG keeps its default from the code. If the var is set to none/null/empty,
+    we set that config key to None (e.g. START_FROM_LINE=none → start from beginning).
     """
     for key in list(config.keys()):
         env_key = (env_prefix + key).upper().replace(" ", "_")
         val = os.getenv(env_key)
+        # Not in .env or commented out → do not update; keep value from code
         if val is None:
             continue
         val = val.strip()
         if key in ("START_FROM_LINE", "MAX_RECORDS", "WAIT_BETWEEN_REQUESTS", "API_TIMEOUT",
                    "BATCH_SIZE", "MAX_OUTPUT_TOKENS", "MAX_TOOL_CALLS", "WAIT_BETWEEN_BATCHES"):
-            parsed = _int_or_none(val)
-            if parsed is not None:
-                config[key] = parsed
+            # Var is present and set to none/null/empty → set config to None (e.g. no start line limit)
+            if val.lower() in ("none", "null", ""):
+                config[key] = None
+            else:
+                parsed = _int_or_none(val)
+                if parsed is not None:
+                    config[key] = parsed
         elif key in ("USE_WEB_SEARCH",):
             config[key] = _bool(val)
         elif key in ("COLUMN_SELLER_ID", "COLUMN_SELLER_NAME", "COLUMN_PRODUCT_NAME", "COLUMN_PRODUCT_DESCRIPTION"):

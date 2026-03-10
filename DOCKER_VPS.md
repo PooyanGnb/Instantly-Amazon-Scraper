@@ -45,10 +45,10 @@ You **don’t need Docker**. Same scripts, same `.env`, same stable connection.
 
 5. **To keep running after you disconnect**, use `nohup` and a log file:
    ```bash
-   nohup python main.py >> main.log 2>&1 &
+   PYTHONUNBUFFERED=1 nohup python main.py >> main.log 2>&1 &
    tail -f main.log    # watch while connected; after reconnect, tail -f or cat main.log
    ```
-   Same idea for `gpt.py` → `gpt.log` and `phone_clean.py` → `phone_clean.log`. Or use **tmux** / **screen** and run the commands in the foreground inside a session.
+   You’ll see `[1] 79244` (job ID) and `nohup: ignoring input` — that’s normal; the job is running. `PYTHONUNBUFFERED=1` makes output appear in `main.log` in real time so `tail -f` shows progress. Same idea for `gpt.py` → `gpt.log` and `phone_clean.py` → `phone_clean.log`. Or use **tmux** / **screen** and run the commands in the foreground inside a session.
 
 No Docker install, no build step—just Python and the repo.
 
@@ -245,6 +245,8 @@ nohup docker compose run --rm app python main.py > main.log 2>&1 &
 # Optional: see live output while still connected
 tail -f main.log
 ```
+
+You’ll see a job ID and `nohup: ignoring input` — that’s normal; the job is running.
 
 After reconnect:
 

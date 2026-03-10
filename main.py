@@ -64,7 +64,8 @@ CONFIG = {
 }
 
 # Override CONFIG from environment variables (for Docker/VPS - no code edit needed)
-load_dotenv()
+# Load .env from the same directory as this script (so it's found regardless of cwd)
+load_dotenv(Path(__file__).resolve().parent / ".env")
 from config_env import override_from_env
 override_from_env(CONFIG)
 
@@ -72,10 +73,10 @@ override_from_env(CONFIG)
 # SCRIPT IMPLEMENTATION - Do not modify below unless you know what you're doing
 # ============================================================================
 
-API_KEY = os.getenv('API_KEY')
+API_KEY = (os.getenv('API_KEY') or '').strip()
 
 if not API_KEY:
-    raise ValueError("API_KEY not found in .env file!")
+    raise ValueError("API_KEY not found in .env file! Put it in the same folder as main.py.")
 
 BASE_URL = "https://ecom.webscrapingapi.com/v1"
 
