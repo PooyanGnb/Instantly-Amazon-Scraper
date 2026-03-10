@@ -54,15 +54,11 @@ CONFIG = {
     'COLUMN_PRODUCT_DESCRIPTION': ['Product Description'],
 }
 
-# Override CONFIG from environment variables (for Docker/VPS - no code edit needed)
-load_dotenv()
-from config_env import override_from_env
-override_from_env(CONFIG)
-
 # ============================================================================
 # SCRIPT IMPLEMENTATION
 # ============================================================================
 
+load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 if not OPENAI_API_KEY:

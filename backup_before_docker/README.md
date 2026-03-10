@@ -142,11 +142,9 @@ Other columns (Seller Name, Email, etc.) are passed through to the enriched and 
 ## Other files
 
 - **[PROJECT.md](PROJECT.md)** – project reference: order of use, purpose of each script, config summary, checklist.
-- **[DOCKER_VPS.md](DOCKER_VPS.md)** – run on a VPS with Docker; config via env vars (no code edit); Docker vs plain Python.
 - **phone_clean.py** – cleans phone numbers in a CSV column (digits only, +49 fix, `'` prefix for sheets); run after gpt.py.
 - **ping_check.py** – utility (connectivity check); not part of the main pipeline.
 - **.env** – not committed; hold `API_KEY` and `OPENAI_API_KEY` here.
-- **backup_before_docker/** – backup of code before Docker/env-based config was added.
 
 ## License
 

@@ -1,0 +1,26 @@
+# Amazon Scraper pipeline - run on VPS with stable connection
+# Usage: see DOCKER_VPS.md
+
+services:
+  app:
+    build: .
+    image: amazon-scraper:latest
+    container_name: amazon-scraper
+    env_file: .env
+    environment:
+      # Paths are under /app/data (mounted from host ./data)
+      - INPUT_CSV=data/leads.csv
+      - OUTPUT_CSV=data/enriched.csv
+      # Optional: limit range
+      # - START_FROM_LINE=1
+      # - MAX_RECORDS=100
+      # Optional: column mapping if your CSV differs (comma-separated)
+      # - COLUMN_SELLER_ID=Seller URL,Seller ID
+      # - COLUMN_SELLER_NAME=Seller Name
+    volumes:
+      - ./data:/app/data
+    # Override command to run a specific step (default: main.py)
+    # command: ["python", "main.py"]
+    # command: ["python", "gpt.py"]
+    # command: ["python", "phone_clean.py"]
+    restart: "no"

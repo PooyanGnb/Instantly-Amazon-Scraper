@@ -63,15 +63,12 @@ CONFIG = {
     'COLUMN_SELLER_NAME': ['Seller Name'],
 }
 
-# Override CONFIG from environment variables (for Docker/VPS - no code edit needed)
-load_dotenv()
-from config_env import override_from_env
-override_from_env(CONFIG)
-
 # ============================================================================
 # SCRIPT IMPLEMENTATION - Do not modify below unless you know what you're doing
 # ============================================================================
 
+# Load environment variables
+load_dotenv()
 API_KEY = os.getenv('API_KEY')
 
 if not API_KEY:

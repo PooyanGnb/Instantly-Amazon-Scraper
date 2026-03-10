@@ -27,10 +27,6 @@ CONFIG = {
     'COLUMN_PHONE_OUTPUT': 'Company Phone',  # e.g. 'Phone Cleaned' to add a new column
 }
 
-# Override CONFIG from environment variables (for Docker/VPS - no code edit needed)
-from config_env import override_from_env
-override_from_env(CONFIG)
-
 # ============================================================================
 # CLEANING LOGIC
 # ============================================================================

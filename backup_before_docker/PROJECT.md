@@ -110,13 +110,6 @@ pip install -r requirements.txt
 
 (requests, python-dotenv, openai)
 
-### Config without editing code (Docker / VPS)
-
-You can override all important settings with **environment variables** (no code change). See **[DOCKER_VPS.md](DOCKER_VPS.md)** for:
-- Running in Docker on a VPS
-- Full list of env vars (INPUT_CSV, OUTPUT_CSV, START_FROM_LINE, MAX_RECORDS, etc.)
-- Docker vs plain Python on VPS
-
 ---
 
 ## Quick checklist for a new batch

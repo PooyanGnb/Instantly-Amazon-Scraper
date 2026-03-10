@@ -1,0 +1,12 @@
+venv
+.env
+.git
+__pycache__
+*.pyc
+backup_before_docker
+*.csv
+data/
+csv/
+.DS_Store
+*.md
+!README.md
