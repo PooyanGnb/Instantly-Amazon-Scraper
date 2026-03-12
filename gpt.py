@@ -9,6 +9,7 @@ import os
 import re
 import time
 import json
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -55,7 +56,8 @@ CONFIG = {
 }
 
 # Override CONFIG from environment variables (for Docker/VPS - no code edit needed)
-load_dotenv()
+# Load .env from the same directory as this script (so it's found regardless of cwd)
+load_dotenv(Path(__file__).resolve().parent / ".env")
 from config_env import override_from_env
 override_from_env(CONFIG)
 
@@ -63,10 +65,10 @@ override_from_env(CONFIG)
 # SCRIPT IMPLEMENTATION
 # ============================================================================
 
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_API_KEY = (os.getenv('OPENAI_API_KEY') or '').strip()
 
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found in .env file!")
+    raise ValueError("OPENAI_API_KEY not found in .env file! Put it in the same folder as gpt.py.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
