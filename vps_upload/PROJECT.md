@@ -13,6 +13,7 @@ Run the scripts in this order. Each step uses the output of the previous one (or
 | **1** | **main.py**   | Leads CSV (e.g. `Bunch 3 - Verified.csv`) | Enriched CSV (e.g. `Bunch 3 - Amazon.csv`) |
 | **2** | **gpt.py**    | Enriched CSV (e.g. `Bunch 3 - Amazon.csv`) | Final CSV (e.g. `Bunch 3 - Final.csv`) |
 | **3** | **phone_clean.py** | Final CSV (e.g. `Bunch 3 - Final.csv`) | Ready CSV (e.g. `Bunch 3 - Ready.csv`) |
+| **Alt flow** | **amazon_resellers_pipeline.py** | CSV with `Amazon Link` | Final reseller CSV (`Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`) |
 
 **One-line summary:**  
 Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **phone_clean.py** (clean phones) → ready for use (e.g. email campaigns).
@@ -61,6 +62,19 @@ Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **ph
 - **Config (top of file):** `INPUT_CSV`, `OUTPUT_CSV`, `COLUMN_PHONE`, `COLUMN_PHONE_OUTPUT`.
 
 ---
+
+---
+
+### 5. amazon_resellers_pipeline.py – Reseller discovery + product-name cleanup (3 stages)
+
+- **Purpose:** End-to-end pipeline for reseller inputs where each row has an `Amazon Link` (URL or ASIN).
+- **Stage 1:** Extract ASIN from `Amazon Link`, call product endpoint, add `Amazon Brand` + `Amazon Title`. Writes in batches of 10 by default.
+- **Stage 2:** Search Amazon by `Amazon Brand`, pick 2 *different* products (not same as source title, avoid near-duplicate variants), add `Product1 Title`, `Product1 Link`, `Product2 Title`, `Product2 Link`. Writes in batches of 5 by default.
+- **Stage 3:** GPT cleans `Product1/2 Title` to pure names (`Product1 Name`, `Product2 Name`), then writes final CSV with:
+  - original input columns + `Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`
+  - removes temporary stage columns (`Amazon Brand`, `Amazon Title`, `Product1 Title`, `Product2 Title`)
+- **Needs:** `.env` with both `API_KEY` and `OPENAI_API_KEY`.
+- **Config:** uses same env-override style as other scripts through `config_env.py` (supports none/null/empty behavior).
 
 ### 4. ping_check.py – Utility (not part of pipeline)
 
@@ -126,3 +140,9 @@ You can override all important settings with **environment variables** (no code 
 3. In **gpt.py**: set `INPUT_CSV` = output of step 2, `OUTPUT_CSV` = final file, run `python gpt.py`.
 4. In **phone_clean.py**: set `INPUT_CSV` = output of step 3, `OUTPUT_CSV` and phone column, run `python phone_clean.py`.
 5. Use the last output (e.g. `Bunch X - Ready.csv`) for campaigns.
+
+### Alternative reseller flow
+
+1. Set `.env` keys for `amazon_resellers_pipeline.py` (input + stage outputs + final output).
+2. Run `python amazon_resellers_pipeline.py`.
+3. Use `FINAL_OUTPUT_CSV` (contains input columns + Product1/2 links + Product1/2 cleaned names).

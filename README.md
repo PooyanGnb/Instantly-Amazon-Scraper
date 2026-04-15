@@ -97,6 +97,24 @@ python gpt.py
 
 Output: **Final CSV** with all previous columns plus **Variable 1** and **Variable 2**.
 
+## Alternative Flow: Amazon Resellers Pipeline
+
+Use `amazon_resellers_pipeline.py` when your input has an `Amazon Link` column (URL or ASIN).
+
+- **Stage 1:** product endpoint by ASIN → adds `Amazon Brand`, `Amazon Title`
+- **Stage 2:** brand search → adds `Product1 Title`, `Product1 Link`, `Product2 Title`, `Product2 Link`
+- **Stage 3:** GPT cleanup of titles → final keeps original input columns + `Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`
+- Batch writes are built-in (10 / 5 / 5 defaults), with verbose live logs in terminal.
+
+Run:
+
+```bash
+python amazon_resellers_pipeline.py
+```
+
+Configure through `.env` using the same `config_env.py` style as other scripts (`none/null/empty` supported for nullable numeric keys).
+
+
 ## Configuration summary
 
 ### main.py
@@ -144,6 +162,7 @@ Other columns (Seller Name, Email, etc.) are passed through to the enriched and 
 - **[PROJECT.md](PROJECT.md)** – project reference: order of use, purpose of each script, config summary, checklist.
 - **[DOCKER_VPS.md](DOCKER_VPS.md)** – run on a VPS with Docker; config via env vars (no code edit); Docker vs plain Python.
 - **phone_clean.py** – cleans phone numbers in a CSV column (digits only, +49 fix, `'` prefix for sheets); run after gpt.py.
+- **amazon_resellers_pipeline.py** – 3-stage reseller flow (`Amazon Link` -> brand/title -> 2 related products -> GPT-clean names).
 - **ping_check.py** – utility (connectivity check); not part of the main pipeline.
 - **.env** – not committed; hold `API_KEY` and `OPENAI_API_KEY` here.
 - **backup_before_docker/** – backup of code before Docker/env-based config was added.

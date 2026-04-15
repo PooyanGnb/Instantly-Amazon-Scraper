@@ -8,10 +8,12 @@ This guide explains how to run the Amazon Scraper pipeline in Docker on an Ubunt
 
 **Short answer:** Both work. For your case (stable connection, fewer connection errors), either is fine.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Docker** | Same environment everywhere; no “works on my machine”; easy to re-deploy; config via env vars. | Extra layer; slightly more setup. |
+
+| Approach                | Pros                                                                                             | Cons                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------- |
+| **Docker**              | Same environment everywhere; no “works on my machine”; easy to re-deploy; config via env vars.   | Extra layer; slightly more setup.                    |
 | **Plain Python on VPS** | Simpler: upload code, `pip install -r requirements.txt`, run `python main.py`. No Docker needed. | You manage Python version and dependencies yourself. |
+
 
 **Recommendation:** If you’re comfortable with SSH and Python, **running the scripts directly on Ubuntu** (upload repo, create `.env`, run `python main.py` then `gpt.py` then `phone_clean.py`) is the simplest way and will give you the same stable connection. Use **Docker** if you want a fixed, reproducible environment or plan to run several services on the same VPS.
 
@@ -24,31 +26,67 @@ Config is now **environment-based** in both cases: with or without Docker, you c
 You **don’t need Docker**. Same scripts, same `.env`, same stable connection.
 
 1. **Upload the project** to the VPS (e.g. `~/amazon-scraper`). Put your leads CSV in the project folder or in a `data/` subfolder (and set `INPUT_CSV` in `.env` to match, e.g. `data/leads.csv` or `leads.csv`).
-
 2. **Install Python 3 and dependencies** (Ubuntu):
-   ```bash
+  ```bash
    sudo apt update && sudo apt install -y python3 python3-pip python3-venv
    cd ~/amazon-scraper
    python3 -m venv venv && source venv/bin/activate
    pip install -r requirements.txt
-   ```
-
+  ```
 3. **Create `.env`** in the project root with `API_KEY`, `OPENAI_API_KEY`, and any overrides (`INPUT_CSV`, `OUTPUT_CSV`, etc.). Same as for Docker.
-
 4. **Run the pipeline** (same order as in PROJECT.md):
-   ```bash
+  ```bash
    source venv/bin/activate   # if not already in venv
    python main.py             # step 1
    python gpt.py             # step 2 (set INPUT_CSV/OUTPUT_CSV in .env first)
    python phone_clean.py      # step 3
-   ```
+  ```
 
-5. **To keep running after you disconnect**, use `nohup` and a log file:
-   ```bash
-   PYTHONUNBUFFERED=1 nohup python main.py >> main.log 2>&1 &
-   tail -f main.log    # watch while connected; after reconnect, tail -f or cat main.log
-   ```
+python amazon_resellers_pipeline.py   # alternative all-in-one reseller flow
+
    You’ll see `[1] 79244` (job ID) and `nohup: ignoring input` — that’s normal; the job is running. `PYTHONUNBUFFERED=1` makes output appear in `main.log` in real time so `tail -f` shows progress. Same idea for `gpt.py` → `gpt.log` and `phone_clean.py` → `phone_clean.log`. Or use **tmux** / **screen** and run the commands in the foreground inside a session.
+
+### 6. Run so the job survives connection drop (nohup + log file)
+
+If your SSH connection drops, a normal foreground run would be killed. To keep the run alive after disconnect, use **nohup** and redirect output to a log file.
+
+**Pattern (run in background; output appended to log):**
+
+```bash
+cd ~/amazon-scraper
+source venv/bin/activate
+
+PYTHONUNBUFFERED=1 nohup python main.py >> main.log 2>&1 &
+tail -f main.log    # watch while connected; after reconnect, tail -f or cat main.log
+```
+
+- `PYTHONUNBUFFERED=1` - output appears in the log in real time.
+- `nohup ... &` - process keeps running after you disconnect (or close terminal).
+- `>> file.log 2>&1` - stdout and stderr go to the same log file (append mode).
+- On reconnect, use `tail -f <log>` if still running, or `cat <log>` when done.
+
+**Same pattern for project scripts** (use a different log file per script):
+
+
+| Script                         | Command                                                                                   | Log file              |
+| ------------------------------ | ----------------------------------------------------------------------------------------- | --------------------- |
+| `main.py`                      | `PYTHONUNBUFFERED=1 nohup python main.py >> main.log 2>&1 &`                              | `main.log`            |
+| `gpt.py`                       | `PYTHONUNBUFFERED=1 nohup python gpt.py >> gpt.log 2>&1 &`                                | `gpt.log`             |
+| `phone_clean.py`               | `PYTHONUNBUFFERED=1 nohup python phone_clean.py >> phone_clean.log 2>&1 &`                | `phone_clean.log`     |
+| `amazon_resellers_pipeline.py` | `PYTHONUNBUFFERED=1 nohup python amazon_resellers_pipeline.py >> resellers.log 2>&1 &`    | `resellers.log`       |
+| `amazon_seller_pipeline.py`    | `PYTHONUNBUFFERED=1 nohup python amazon_seller_pipeline.py >> seller_pipeline.log 2>&1 &` | `seller_pipeline.log` |
+
+
+**Run variant (save PID to a file):**
+
+```bash
+PYTHONUNBUFFERED=1 nohup python amazon_resellers_pipeline.py >> resellers.log 2>&1 & echo $! > resellers.pid
+```
+
+- Check PID later: `cat resellers.pid`
+- Stop by saved PID: `kill $(cat resellers.pid)`
+
+Watch progress with `tail -f main.log` (or the log you used). After reconnect, same command or `cat main.log` for full output.
 
 No Docker install, no build step—just Python and the repo.
 
@@ -118,6 +156,12 @@ docker compose run --rm app python gpt.py
 
 # Step 3: Clean phones
 docker compose run --rm app python phone_clean.py
+
+# Alternative: run reseller 3-stage pipeline
+docker compose run --rm app python amazon_resellers_pipeline.py
+
+# Alternative: run seller 4-stage pipeline
+docker compose run --rm app python amazon_seller_pipeline.py
 ```
 
 For steps 2 and 3, set the right input/output in `.env` (or in `docker-compose.yml` under `environment`). Example for step 2:
@@ -173,7 +217,7 @@ To avoid that, run the job in a way that **survives disconnect**, then reattach 
 
 ### Quick way: use the helper script (survives disconnect, no extra install)
 
-In the project root there is **`run_survive.sh`**. It runs the step in the background with `nohup` and writes all output to a log file, so the job keeps running after you disconnect.
+In the project root there is `**run_survive.sh`**. It runs the step in the background with `nohup` and writes all output to a log file, so the job keeps running after you disconnect.
 
 ```bash
 chmod +x run_survive.sh
@@ -270,41 +314,70 @@ All important settings can be overridden with **environment variables**. The scr
 
 ### main.py (scraper)
 
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `INPUT_CSV` | `data/leads.csv` | Input leads CSV path (under `/app/data` in container). |
-| `OUTPUT_CSV` | `data/enriched.csv` | Output enriched CSV path. |
-| `START_FROM_LINE` | `1` or empty | First record to process (1-based). Omit or empty = from start. |
-| `MAX_RECORDS` | `100` or empty | Max records to process. Omit or empty = all. |
-| `WAIT_BETWEEN_REQUESTS` | `2` | Seconds between API requests. |
-| `AMAZON_DOMAIN` | `amazon.de` | Amazon marketplace. |
-| `COLUMN_SELLER_ID` | `Seller URL,Seller ID` | Comma-separated column names for seller ID. |
-| `COLUMN_SELLER_NAME` | `Seller Name` | Column name for seller name. |
+
+| Variable                | Example                | Description                                                    |
+| ----------------------- | ---------------------- | -------------------------------------------------------------- |
+| `INPUT_CSV`             | `data/leads.csv`       | Input leads CSV path (under `/app/data` in container).         |
+| `OUTPUT_CSV`            | `data/enriched.csv`    | Output enriched CSV path.                                      |
+| `START_FROM_LINE`       | `1` or empty           | First record to process (1-based). Omit or empty = from start. |
+| `MAX_RECORDS`           | `100` or empty         | Max records to process. Omit or empty = all.                   |
+| `WAIT_BETWEEN_REQUESTS` | `2`                    | Seconds between API requests.                                  |
+| `AMAZON_DOMAIN`         | `amazon.de`            | Amazon marketplace.                                            |
+| `COLUMN_SELLER_ID`      | `Seller URL,Seller ID` | Comma-separated column names for seller ID.                    |
+| `COLUMN_SELLER_NAME`    | `Seller Name`          | Column name for seller name.                                   |
+
 
 ### gpt.py
 
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `INPUT_CSV` | `data/enriched.csv` | Input (enriched) CSV. |
-| `OUTPUT_CSV` | `data/final.csv` | Output CSV with Variable 1 & 2. |
-| `START_FROM_LINE` | `1` or empty | First record (1-based). |
-| `MAX_RECORDS` | `100` or empty | Max records. |
-| `BATCH_SIZE` | `5` | Records per GPT call. |
-| `MODEL` | `gpt-5-mini` | OpenAI model. |
-| `WAIT_BETWEEN_BATCHES` | `2` | Seconds between batch API calls. |
-| `COLUMN_SELLER_ID` | `Seller URL,Seller ID` | Comma-separated. |
-| `COLUMN_SELLER_NAME` | `Seller Name` | |
-| `COLUMN_PRODUCT_NAME` | `Product Name` | |
-| `COLUMN_PRODUCT_DESCRIPTION` | `Product Description` | |
+
+| Variable                     | Example                | Description                      |
+| ---------------------------- | ---------------------- | -------------------------------- |
+| `INPUT_CSV`                  | `data/enriched.csv`    | Input (enriched) CSV.            |
+| `OUTPUT_CSV`                 | `data/final.csv`       | Output CSV with Variable 1 & 2.  |
+| `START_FROM_LINE`            | `1` or empty           | First record (1-based).          |
+| `MAX_RECORDS`                | `100` or empty         | Max records.                     |
+| `BATCH_SIZE`                 | `5`                    | Records per GPT call.            |
+| `MODEL`                      | `gpt-5-mini`           | OpenAI model.                    |
+| `WAIT_BETWEEN_BATCHES`       | `2`                    | Seconds between batch API calls. |
+| `COLUMN_SELLER_ID`           | `Seller URL,Seller ID` | Comma-separated.                 |
+| `COLUMN_SELLER_NAME`         | `Seller Name`          |                                  |
+| `COLUMN_PRODUCT_NAME`        | `Product Name`         |                                  |
+| `COLUMN_PRODUCT_DESCRIPTION` | `Product Description`  |                                  |
+
 
 ### phone_clean.py
 
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `INPUT_CSV` | `data/final.csv` | Input CSV. |
-| `OUTPUT_CSV` | `data/ready.csv` | Output CSV (can be same as input). |
-| `COLUMN_PHONE` | `Company Phone` | Column with phone numbers. |
-| `COLUMN_PHONE_OUTPUT` | `Company Phone` | Column to write cleaned numbers (same or new name). |
+
+| Variable              | Example          | Description                                         |
+| --------------------- | ---------------- | --------------------------------------------------- |
+| `INPUT_CSV`           | `data/final.csv` | Input CSV.                                          |
+| `OUTPUT_CSV`          | `data/ready.csv` | Output CSV (can be same as input).                  |
+| `COLUMN_PHONE`        | `Company Phone`  | Column with phone numbers.                          |
+| `COLUMN_PHONE_OUTPUT` | `Company Phone`  | Column to write cleaned numbers (same or new name). |
+
+### amazon_seller_pipeline.py (fixed prefix: `SELLER_`)
+
+| Variable                         | Example                        | Description                                                                 |
+| -------------------------------- | ------------------------------ | --------------------------------------------------------------------------- |
+| `SELLER_KEYWORD`                 | `ALCLEAR`                      | Stage 1 keyword for Amazon search.                                          |
+| `SELLER_TOTAL_PAGES`             | `1`                            | Stage 1 page loop count (starts from page 1).                               |
+| `SELLER_STAGE1_OUTPUT_CSV`       | `data/seller_stage1.csv`       | Stage 1 output CSV.                                                         |
+| `SELLER_STAGE2_OUTPUT_CSV`       | `data/seller_stage2.csv`       | Stage 2 output CSV.                                                         |
+| `SELLER_STAGE3_OUTPUT_CSV`       | `data/seller_stage3.csv`       | Stage 3 kept output (allowed seller regions only).                          |
+| `SELLER_STAGE3_WIPED_OUTPUT_CSV` | `data/seller_stage3_wiped.csv` | Stage 3 wiped output (empty/unsupported region rows).                       |
+| `SELLER_FINAL_OUTPUT_CSV`        | `data/seller_final.csv`        | Stage 4 final output (email/number added; seller description removed).      |
+| `SELLER_AMAZON_DOMAIN`           | `amazon.de`                    | Amazon marketplace.                                                         |
+| `SELLER_API_TIMEOUT`             | `60`                           | API timeout in seconds.                                                     |
+| `SELLER_WAIT_BETWEEN_REQUESTS`   | `1`                            | Delay between Web Scraping API calls.                                       |
+| `SELLER_WAIT_BETWEEN_BATCHES`    | `1`                            | Delay between GPT batches in Stage 4.                                       |
+| `SELLER_STAGE1_WRITE_BATCH_SIZE` | `100`                          | Stage 1 CSV flush size.                                                     |
+| `SELLER_STAGE2_WRITE_BATCH_SIZE` | `100`                          | Stage 2 CSV flush size.                                                     |
+| `SELLER_STAGE3_WRITE_BATCH_SIZE` | `100`                          | Stage 3 CSV flush size.                                                     |
+| `SELLER_STAGE4_BATCH_SIZE`       | `10`                           | Rows per GPT request in Stage 4 (whole batch retried up to 3 times).        |
+| `SELLER_MODEL`                   | `gpt-5-mini`                   | OpenAI model for Stage 4 extraction.                                        |
+| `SELLER_REASONING_EFFORT`        | `medium`                       | OpenAI reasoning effort for Stage 4.                                        |
+| `SELLER_MAX_OUTPUT_TOKENS`       | `5000`                         | Max tokens for Stage 4 GPT response.                                        |
+
 
 Paths in the container are under `/app/data`; the host directory `./data` is mounted there, so use `data/...` in these variables.
 
@@ -337,16 +410,19 @@ Use **scp** or **rsync** over SSH (replace `user` with your VPS username and `VP
 ### Upload (laptop → VPS)
 
 **Single file** (e.g. a CSV into `data/`):
+
 ```bash
 scp /path/on/laptop/file.csv user@VPS_IP:~/amazon-scraper/data/
 ```
 
 **Whole project folder** (e.g. contents of `vps_upload`):
+
 ```bash
 scp -r /path/to/vps_upload/* user@VPS_IP:~/amazon-scraper/
 ```
 
 **Folder with rsync** (skips unchanged files; exclude venv and .env if you prefer):
+
 ```bash
 rsync -avz --exclude 'venv' --exclude '.env' /path/to/vps_upload/ user@VPS_IP:~/amazon-scraper/
 ```
@@ -354,16 +430,19 @@ rsync -avz --exclude 'venv' --exclude '.env' /path/to/vps_upload/ user@VPS_IP:~/
 ### Download (VPS → laptop)
 
 **Single file** (e.g. output CSV or log):
+
 ```bash
 scp user@VPS_IP:~/amazon-scraper/data/enriched.csv /path/on/laptop/
 ```
 
 **Whole `data/` folder** (all CSVs):
+
 ```bash
 scp -r user@VPS_IP:~/amazon-scraper/data /path/on/laptop/
 ```
 
 **With rsync**:
+
 ```bash
 rsync -avz user@VPS_IP:~/amazon-scraper/data/ /path/on/laptop/data/
 ```
@@ -379,6 +458,16 @@ rsync -avz -e "ssh -i ~/.ssh/mykey" user@VPS_IP:~/amazon-scraper/data/ ./data/
 
 ---
 
+## Reseller pipeline notes
+
+`amazon_resellers_pipeline.py` is a separate all-in-one flow for inputs with `Amazon Link`.
+It uses both APIs (`API_KEY`, `OPENAI_API_KEY`) and writes 3 files (`STAGE1_OUTPUT_CSV`, `STAGE2_OUTPUT_CSV`, `FINAL_OUTPUT_CSV`) with batch flushes for lower memory usage.
+
+`amazon_seller_pipeline.py` is another all-in-one flow (4 stages: search → product seller → seller profile (including `seller description`, `seller about`, region filter, max two listings per seller with `rank` best/worst) → GPT extraction of email, phone, person in charge, and title from those texts only).
+It also uses both APIs and reads config from `.env` with fixed `SELLER_` prefix keys.
+
+---
+
 ## 9. Backup
 
-A copy of the code before Docker-related changes is in **`backup_before_docker/`**. Use it if you need to revert or compare.
+A copy of the code before Docker-related changes is in `**backup_before_docker/**`. Use it if you need to revert or compare.

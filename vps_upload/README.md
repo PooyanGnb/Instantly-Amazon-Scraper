@@ -1,44 +1,172 @@
-# VPS upload package – Amazon Scraper Docker
+# Instantly Amazon Scraper
 
-Upload this **entire folder** to your VPS (e.g. `~/amazon-scraper`). No need to upload backup, venv, or CSV files from your local machine.
+> **Quick reference:** See **[PROJECT.md](PROJECT.md)** for the **order of use**, purpose of each script, and a checklist so you don’t forget the workflow.
 
-## Quick start on the VPS
+This project takes a list of **Amazon seller leads**, scrapes their Amazon store pages to get product data, then uses GPT to produce **two variables** per lead for use in email campaigns (e.g. short product name and visual selling points).
 
-1. **Create `.env` from the example**
-   ```bash
-   cp .env.example .env
-   nano .env   # or vim: add your real API_KEY and OPENAI_API_KEY
-   ```
+## Overview
 
-2. **Put your leads CSV in `data/`**
-   - e.g. `data/leads.csv` (must match `INPUT_CSV` in `.env`)
+| Step | Script   | What it does |
+|------|----------|--------------|
+| 1    | **main.py** | Reads a CSV of Amazon leads (Seller ID, Seller Name, etc.), calls the Web Scraping API to fetch each seller’s top product and its details, and writes an **enriched** CSV with Product URL, Product Name, and Product Description. |
+| 2    | **gpt.py**  | Reads the enriched CSV, sends batches of product names and descriptions to GPT, and writes a **final** CSV with two extra columns: **Variable 1** (short product name) and **Variable 2** (visual selling points). |
 
-3. **Build and run** (so it keeps running after you disconnect, use the script):
-   ```bash
-   docker compose build
-   chmod +x run_survive.sh
-   ./run_survive.sh main.py         # step 1: scrape → log in main.log
-   # Then set INPUT_CSV=data/enriched.csv, OUTPUT_CSV=data/final.csv in .env
-   ./run_survive.sh gpt.py          # step 2: GPT → gpt.log
-   ./run_survive.sh phone_clean.py  # step 3: phones → phone_clean.log
-   ```
-   After reconnect: `tail -f main.log` (or the log for the step you ran).
+So: **Leads CSV → main.py (scrape) → Enriched CSV → gpt.py (GPT) → Final CSV with 2 variables.**
 
-Full instructions and all env vars: **DOCKER_VPS.md** (includes upload/download to VPS with scp/rsync).
+## Pipeline
 
-## Output files and logs
+```
+Input CSV (leads)     main.py (scrape)      Enriched CSV      gpt.py (GPT)      Final CSV
+─────────────────→   ─────────────────→    ─────────────→    ─────────────→   ─────────────
+Seller ID, Name, …   Web Scraping API      + Product URL,     OpenAI API        + Variable 1,
+                     (seller products +    Product Name,      (batch)           Variable 2
+                      product details)      Product Description
+```
 
-- **Output CSVs** are written into `data/` on the VPS (the same folder is mounted into the container). You do **not** need to extract anything from the container.
-- **Logs** appear in the terminal when you run `docker compose run --rm app python main.py` (or gpt.py / phone_clean.py). To also save to a file: `docker compose run --rm app python main.py 2>&1 | tee main.log`
+## The Two Amazon Variables (from gpt.py)
 
-See **DOCKER_VPS.md** §4 for details.
+For each lead/product, GPT returns:
 
-## Contents
+| Variable   | Description |
+|-----------|-------------|
+| **Variable 1** | Short, memorable product name (3–4 words, German), suitable for use in acquisition emails. |
+| **Variable 2** | 2–3 concrete, visually representable selling points/features (from the product description), comma-separated, in German, for use in visuals. |
 
-| File / folder   | Purpose |
-|-----------------|--------|
-| `.env.example`  | Template for `.env` – copy to `.env` and add your API keys |
-| `data/`         | Put input CSVs here; output CSVs appear here on the VPS |
-| `run_survive.sh` | Run a step in background so it survives SSH disconnect; logs to main.log / gpt.log / phone_clean.log |
-| `DOCKER_VPS.md` | Full Docker + env var guide; output files and logs |
-| `PROJECT.md`    | Pipeline order and script purposes |
+These are written as extra columns in the final CSV.
+
+## Setup
+
+### 1. Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+- `requests` – API calls (Web Scraping API)
+- `python-dotenv` – load `.env`
+- `openai` – GPT (Responses API)
+
+### 2. Environment variables
+
+Create a `.env` in the project root:
+
+```env
+# Web Scraping API (used by main.py)
+API_KEY=your_web_scraping_api_key
+
+# OpenAI (used by gpt.py)
+OPENAI_API_KEY=your_openai_api_key
+```
+
+- **main.py** needs `API_KEY` for [Web Scraping API](https://www.webscrapingapi.com/) (Amazon seller/products).
+- **gpt.py** needs `OPENAI_API_KEY` for OpenAI (e.g. GPT).
+
+## Usage
+
+### Step 1: Scrape Amazon (main.py)
+
+1. Put your leads CSV in the project folder (e.g. `NEW Jan 2026 - Not Reached Yet.csv`).
+2. In **main.py**, set `CONFIG`:
+   - `INPUT_CSV` – input leads file name
+   - `OUTPUT_CSV` – enriched output (e.g. `NEW enriched_sellers.csv`)
+   - `START_FROM_LINE` / `MAX_RECORDS` – optional range
+   - `AMAZON_DOMAIN` – e.g. `amazon.de`
+   - `WAIT_BETWEEN_REQUESTS` – delay between API calls
+3. Run:
+
+```bash
+python main.py
+```
+
+Output: **Enriched CSV** with original columns plus **Product URL**, **Product Name**, **Product Description**.
+
+### Step 2: GPT variables (gpt.py)
+
+1. Use the enriched CSV as input (e.g. `NEW enriched_sellers.csv`).
+2. In **gpt.py**, set `CONFIG`:
+   - `INPUT_CSV` – enriched file
+   - `OUTPUT_CSV` – final file (e.g. `NEW final_sellers.csv`)
+   - `BATCH_SIZE` – records per GPT call (e.g. 5)
+   - `MODEL` – e.g. `gpt-5-mini`
+   - `START_FROM_LINE` / `MAX_RECORDS` – optional
+3. Run:
+
+```bash
+python gpt.py
+```
+
+Output: **Final CSV** with all previous columns plus **Variable 1** and **Variable 2**.
+
+## Alternative Flow: Amazon Resellers Pipeline
+
+Use `amazon_resellers_pipeline.py` when your input has an `Amazon Link` column (URL or ASIN).
+
+- **Stage 1:** product endpoint by ASIN → adds `Amazon Brand`, `Amazon Title`
+- **Stage 2:** brand search → adds `Product1 Title`, `Product1 Link`, `Product2 Title`, `Product2 Link`
+- **Stage 3:** GPT cleanup of titles → final keeps original input columns + `Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`
+- Batch writes are built-in (10 / 5 / 5 defaults), with verbose live logs in terminal.
+
+Run:
+
+```bash
+python amazon_resellers_pipeline.py
+```
+
+Configure through `.env` using the same `config_env.py` style as other scripts (`none/null/empty` supported for nullable numeric keys).
+
+
+## Configuration summary
+
+### main.py
+
+| Key                    | Purpose |
+|------------------------|--------|
+| `INPUT_CSV`            | Leads CSV filename |
+| `OUTPUT_CSV`           | Enriched CSV filename |
+| `START_FROM_LINE`      | 1-based record to start from (or `None`) |
+| `MAX_RECORDS`          | Max records to process (or `None` = all) |
+| `WAIT_BETWEEN_REQUESTS`| Seconds between API requests |
+| `AMAZON_DOMAIN`        | e.g. `amazon.de` |
+
+### gpt.py
+
+| Key                    | Purpose |
+|------------------------|--------|
+| `INPUT_CSV`            | Enriched CSV filename |
+| `OUTPUT_CSV`           | Final CSV filename |
+| `START_FROM_LINE`      | 1-based record to start from (or `None`) |
+| `MAX_RECORDS`          | Max records (or `None` = all) |
+| `BATCH_SIZE`           | Records per GPT call |
+| `MODEL`                | OpenAI model (e.g. `gpt-5-mini`) |
+| `WAIT_BETWEEN_BATCHES` | Seconds between batch API calls |
+
+## Input CSV (leads)
+
+Expected to contain at least:
+
+- **Seller ID** – used to fetch seller products and to skip already-processed rows in both scripts.
+
+Other columns (Seller Name, Email, etc.) are passed through to the enriched and final CSVs.
+
+## Output columns added
+
+- **After main.py:** `Product URL`, `Product Name`, `Product Description`
+- **After gpt.py:** `Variable 1`, `Variable 2` (short product name and visual selling points for Amazon/email use)
+
+## Resuming
+
+- **main.py** and **gpt.py** both skip sellers that already appear in their output file (by **Seller ID**). You can re-run and they will only process new leads.
+
+## Other files
+
+- **[PROJECT.md](PROJECT.md)** – project reference: order of use, purpose of each script, config summary, checklist.
+- **[DOCKER_VPS.md](DOCKER_VPS.md)** – run on a VPS with Docker; config via env vars (no code edit); Docker vs plain Python.
+- **phone_clean.py** – cleans phone numbers in a CSV column (digits only, +49 fix, `'` prefix for sheets); run after gpt.py.
+- **amazon_resellers_pipeline.py** – 3-stage reseller flow (`Amazon Link` -> brand/title -> 2 related products -> GPT-clean names).
+- **ping_check.py** – utility (connectivity check); not part of the main pipeline.
+- **.env** – not committed; hold `API_KEY` and `OPENAI_API_KEY` here.
+- **backup_before_docker/** – backup of code before Docker/env-based config was added.
+
+## License
+
+See [LICENSE](LICENSE).
