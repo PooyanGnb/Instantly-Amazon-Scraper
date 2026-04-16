@@ -31,6 +31,11 @@ Stage 4:
 - Extract seller email, seller number, person in charge, their title (e.g. Geschäftsführer)
 - Output removes seller description and seller about; adds:
   seller email, seller number, seller incharge person, seller person title
+
+Stage 5:
+- Read Stage 4 CSV; clean company name from seller name; company domain from seller email (non-public domains only; see public_email_domains.txt)
+- Apollo: find organization (domain preferred, else name), list people, GPT picks top suitable contacts, then people/match for first verified email
+- Output: all Stage 4 columns + apollo name, apollo title, apollo email (only rows that complete the full chain)
 """
 
 import csv
@@ -40,6 +45,7 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import List, Tuple
 from urllib.parse import quote_plus
 
 import requests
@@ -58,7 +64,8 @@ CONFIG = {
     "STAGE2_OUTPUT_CSV": "data/seller_stage2.csv",
     "STAGE3_OUTPUT_CSV": "data/seller_stage3.csv",
     "STAGE3_WIPED_OUTPUT_CSV": "data/seller_stage3_wiped.csv",
-    "FINAL_OUTPUT_CSV": "data/seller_final.csv",
+    "STAGE4_OUTPUT_CSV": "data/seller_final.csv",
+    "STAGE5_OUTPUT_CSV": "data/seller_stage5.csv",
 
     # API settings
     "AMAZON_DOMAIN": "amazon.de",
@@ -77,6 +84,10 @@ CONFIG = {
     "STAGE2_WRITE_BATCH_SIZE": 100,
     "STAGE3_WRITE_BATCH_SIZE": 100,
     "STAGE4_BATCH_SIZE": 10,
+    "STAGE5_WRITE_BATCH_SIZE": 50,
+    "APOLLO_BASE_URL": "https://api.apollo.io/api/v1",
+    "APOLLO_API_TIMEOUT": 60,
+    "APOLLO_HTTP_RETRIES": 3,
 
     # GPT settings
     "MODEL": "gpt-5-mini",
@@ -115,10 +126,329 @@ STAGE4_HEADERS = STAGE2_HEADERS + [
     "seller person title",
     "rank",
 ]
+STAGE5_HEADERS = STAGE4_HEADERS + ["apollo name", "apollo title", "apollo email"]
 ALLOWED_REGIONS = {"DE", "AT", "NL", "CH"}
 
 BASE_URL = "https://ecom.webscrapingapi.com/v1"
 client = None
+APOLLO_API_KEY = ""
+PUBLIC_EMAIL_DOMAINS = frozenset()
+
+
+def load_public_email_domains():
+    """Load lowercase public-mail domains from public_email_domains.txt next to this script."""
+    global PUBLIC_EMAIL_DOMAINS
+    p = Path(__file__).resolve().parent / "public_email_domains.txt"
+    domains = set()
+    if p.is_file():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip().lower()
+            if not line or line.startswith("#"):
+                continue
+            domains.add(line)
+    # Always include common bare TLD-ish entries if file missing lines
+    domains.update(
+        {
+            "gmail.com",
+            "googlemail.com",
+            "yahoo.com",
+            "yahoo.de",
+            "hotmail.com",
+            "hotmail.de",
+            "outlook.com",
+            "gmx.de",
+            "web.de",
+            "t-online.de",
+        }
+    )
+    PUBLIC_EMAIL_DOMAINS = frozenset(domains)
+
+
+# Legal form suffixes (longer first) — DE/EU focused; strip repeatedly from seller display name
+_COMPANY_LEGAL_SUFFIXES = [
+    "GmbH & Co. KG",
+    "GmbH & Co.KG",
+    "GmbH & Co KG",
+    "GmbH & Co. KGaA",
+    "AG & Co. KG",
+    "UG (haftungsbeschränkt)",
+    "UG (haftungsbeschrankt)",
+    "eingetragene Genossenschaft",
+    "e.V.",
+    "e. V.",
+    "e.K.",
+    "e.Kfm.",
+    "e.Kfr.",
+    "GmbH",
+    "UG",
+    "AG",
+    "KG",
+    "OHG",
+    "GbR",
+    "PartG",
+    "PartG mbB",
+    "SE",
+    "mbH",
+    "S.A.",
+    "S.A.R.L.",
+    "S.à r.l.",
+    "SARL",
+    "Sàrl",
+    "BV",
+    "B.V.",
+    "NV",
+    "PLC",
+    "Ltd.",
+    "Ltd",
+    "Limited",
+    "LLC",
+    "Inc.",
+    "Inc",
+    "Corp.",
+    "Corp",
+    "Co.",
+    "Co",
+    "LP",
+    "LLP",
+    "Pty Ltd",
+    "Pty. Ltd.",
+    "d.o.o.",
+    "d.o.o",
+    "s.r.o.",
+    "s.r.o",
+    "Sp. z o.o.",
+    "Sp. z o.o",
+    "S.p.A.",
+    "SpA",
+    "Srl",
+    "S.r.l.",
+    "A/S",
+    "ApS",
+    "AB",
+    "Oy",
+    "Oyj",
+    "ASA",
+    "AS",
+    "IKS",
+    "EE",
+    "OÜ",
+    "UAB",
+    "Kft.",
+    "Kft",
+    "Zrt.",
+    "Zrt",
+    "Rt.",
+    "Rt",
+    "Bt.",
+    "Bt",
+    "KH",
+    "A.H.",
+    "AH",
+    "Händler",
+    "Handels GmbH",
+    "Handelsgesellschaft",
+    "Einzelunternehmen",
+]
+
+
+def extract_clean_company_name(seller_name: str) -> str:
+    if not seller_name or str(seller_name).strip().lower() in ("", "null"):
+        return ""
+    s = html.unescape(str(seller_name)).strip()
+    s = re.sub(r"\s+", " ", s)
+    for _ in range(12):
+        changed = False
+        for suf in _COMPANY_LEGAL_SUFFIXES:
+            pat = re.compile(rf"(?i)[\s,./\-\(\[\u2013\u2014&]*{re.escape(suf)}\s*$")
+            ns, n = pat.subn("", s)
+            if n:
+                s = ns.strip(" ,.-–—/&()[]")
+                changed = True
+                break
+        if not changed:
+            break
+    s = re.sub(r"\s+", " ", s).strip(" ,.-–—/&")
+    return s
+
+
+def extract_company_domain_from_email(seller_email: str):
+    """Return domain after @, or None if missing / public-mail / invalid."""
+    if not seller_email or str(seller_email).strip().lower() in ("", "null"):
+        return None
+    em = str(seller_email).strip().strip("'").strip('"')
+    if "@" not in em:
+        return None
+    dom = em.split("@", 1)[1].strip().lower()
+    if not dom or dom in PUBLIC_EMAIL_DOMAINS:
+        return None
+    # strip angle brackets / paths accidentally captured
+    dom = dom.split("/")[0].split("?")[0].strip().rstrip(">")
+    if dom in PUBLIC_EMAIL_DOMAINS:
+        return None
+    return dom or None
+
+
+def apollo_post(path, json_body=None, params=None):
+    url = (CONFIG.get("APOLLO_BASE_URL") or "https://api.apollo.io/api/v1").rstrip("/") + path
+    headers = {
+        "x-api-key": APOLLO_API_KEY,
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+    }
+    last_err = None
+    for attempt in range(1, int(CONFIG.get("APOLLO_HTTP_RETRIES", 3)) + 1):
+        try:
+            r = requests.post(
+                url,
+                headers=headers,
+                json=json_body if json_body is not None else {},
+                params=params,
+                timeout=int(CONFIG.get("APOLLO_API_TIMEOUT", 60)),
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            print(f"      ⚠️  Apollo HTTP attempt {attempt}/{CONFIG.get('APOLLO_HTTP_RETRIES', 3)}: {e}")
+            time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
+    print(f"      ❌ Apollo failed after retries: {last_err}")
+    return None
+
+
+def apollo_search_company(domain, company_name: str):
+    """
+    Return company object with at least {"id": ...} or None.
+    Fallback supported: when organizations[] is empty but accounts[] contains organization_id.
+    """
+    path = "/mixed_companies/search"
+    if domain:
+        data = apollo_post(path, json_body={"q_organization_domains_list": [domain]})
+    else:
+        qn = (company_name or "").strip()
+        if not qn:
+            return None
+        data = apollo_post(path, json_body={"q_organization_name": qn})
+    if not data:
+        return None
+    orgs = data.get("organizations") or []
+    if orgs and isinstance(orgs[0], dict) and orgs[0].get("id"):
+        return orgs[0]
+
+    # Fallback: some responses return only accounts with organization_id.
+    accounts = data.get("accounts") or []
+    if accounts and isinstance(accounts[0], dict):
+        oid = (accounts[0].get("organization_id") or "").strip()
+        if oid:
+            return {"id": oid}
+    return None
+
+
+def apollo_list_people(org_id: str):
+    path = "/mixed_people/api_search"
+    data = apollo_post(path, json_body={"organization_ids": [org_id], "per_page": 100})
+    if not data:
+        return []
+    return data.get("people") or []
+
+
+def apollo_match_person(person_id: str):
+    path = "/people/match"
+    data = apollo_post(path, json_body={"id": person_id})
+    if not data:
+        return None
+    return data.get("person") or data
+
+
+SYSTEM_PROMPT_STAGE5 = """You help choose the best internal contacts at a company for a B2B outreach scenario.
+
+Context:
+- We are a visual / creative studio helping Amazon sellers improve product visuals, A+ content, infographics, listing images, and conversion-focused creative.
+- We want to email the most relevant people who likely influence Amazon listing visuals, brand content, e-commerce merchandising, performance marketing creative, or marketplace operations.
+
+Input:
+- You receive numbered rows. Each row lists Apollo person id and job title (from Apollo only). Titles may be in German or English.
+
+Rules:
+- Pick at most 3 people, ranked best → second → third. Only include people whose titles clearly relate to Amazon/marketplace, e-commerce, performance or growth, marketing, brand, content, creative, design, graphics, product, merchandising, or similar. Skip unrelated roles (pure accounting, HR, IT infrastructure, legal-only, etc.).
+- If fewer than 3 are clearly suitable, return only those (1 or 2). If none are suitable, respond with exactly one line: null
+- Use ONLY the provided ids and titles. Do not invent ids or titles.
+- Output format (no markdown, no extra text):
+  Line 1: <apollo_person_id>, <title exactly as provided or lightly trimmed whitespace>
+  Line 2: optional second
+  Line 3: optional third
+- If nothing suitable: a single line containing only null
+"""
+
+
+def call_gpt_stage5_rank_people(company_name: str, people_lines: List[Tuple[str, str]]):
+    lines = [
+        "Company context name (for orientation only, do not invent contacts): " + (company_name or "unknown"),
+        "Pick up to 3 best Apollo contacts for our Amazon visual/creative outreach (see system rules).",
+        "Nr | apollo_person_id | title",
+        "-" * 80,
+    ]
+    for i, (pid, title) in enumerate(people_lines, 1):
+        lines.append(f"{i} | {pid} | {title}")
+    lines.append("-" * 80)
+    lines.append("Answer with up to 3 lines: id, title per line. Or single line: null")
+    user_prompt = "\n".join(lines)
+    try:
+        response = client.responses.create(
+            model=CONFIG["MODEL"],
+            reasoning={"effort": CONFIG["REASONING_EFFORT"]},
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT_STAGE5},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_output_tokens=int(CONFIG["MAX_OUTPUT_TOKENS"]),
+        )
+        return (response.output_text or "").strip()
+    except Exception as e:
+        print(f"      ❌ GPT stage5 error: {e}")
+        return ""
+
+
+def parse_stage5_gpt_people(text: str):
+    """Returns list of (apollo_id, title) up to 3, or empty if null."""
+    if not text or text.strip().lower() == "null":
+        return []
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip().strip("`")
+        if not s or s.lower() == "null":
+            continue
+        if "," not in s:
+            continue
+        pid, title = s.split(",", 1)
+        pid = pid.strip()
+        title = title.strip()
+        if pid and pid.lower() != "null":
+            out.append((pid, title))
+        if len(out) >= 3:
+            break
+    return out
+
+
+def pick_verified_apollo_contact(ordered_ids: List[str]):
+    """Try people/match in order; return (name, title, email) or None."""
+    for pid in ordered_ids:
+        if not pid:
+            continue
+        person = apollo_match_person(pid)
+        time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
+        if not person or not isinstance(person, dict):
+            continue
+        email = (person.get("email") or "").strip()
+        status = str(person.get("email_status") or "").strip().lower()
+        if email and status == "verified":
+            name = (person.get("name") or "").strip()
+            if not name:
+                fn = (person.get("first_name") or "").strip()
+                ln = (person.get("last_name") or "").strip()
+                name = (fn + " " + ln).strip()
+            title = (person.get("title") or "").strip()
+            return name, title, email
+    return None
 
 
 def null_str(v):
@@ -622,7 +952,7 @@ def stage4():
     print("STAGE 4 - GPT extract contacts + person in charge (about + description)")
     print("=" * 90)
     print(f"📁 Input:  {CONFIG['STAGE3_OUTPUT_CSV']}")
-    print(f"📁 Output: {CONFIG['FINAL_OUTPUT_CSV']}")
+    print(f"📁 Output: {CONFIG['STAGE4_OUTPUT_CSV']}")
     print(f"🤖 Model:  {CONFIG['MODEL']}")
 
     mode = "w"
@@ -657,7 +987,7 @@ def stage4():
                 batch_rows.append(out)
 
             # Flush immediately after each GPT run
-            flush_rows(CONFIG["FINAL_OUTPUT_CSV"], STAGE4_HEADERS, batch_rows, mode)
+            flush_rows(CONFIG["STAGE4_OUTPUT_CSV"], STAGE4_HEADERS, batch_rows, mode)
             written += len(batch_rows)
             print(f"   ✍️  Flushed {len(batch_rows)} rows after GPT run (total written: {written})")
             mode = "a"
@@ -675,10 +1005,139 @@ def stage4():
     print(f"\n✅ STAGE 4 complete. Rows written: {written}")
 
 
+def stage5():
+    print("\n" + "=" * 90)
+    print("STAGE 5 - Apollo enrich (company → people → GPT pick → verified email)")
+    print("=" * 90)
+    print(f"📁 Input:  {CONFIG['STAGE4_OUTPUT_CSV']}")
+    print(f"📁 Output: {CONFIG['STAGE5_OUTPUT_CSV']}")
+    print(f"🤖 Model:  {CONFIG['MODEL']}")
+
+    mode = "w"
+    buf = []
+    written = 0
+    batch_size = int(CONFIG["STAGE5_WRITE_BATCH_SIZE"])
+    skipped = 0
+    cache_hits = 0
+    # seller_key -> tuple(apollo_name, apollo_title, apollo_email) | None (means previously skipped)
+    seller_cache = {}
+
+    with open(CONFIG["STAGE4_OUTPUT_CSV"], "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for idx, row in enumerate(reader, 1):
+            raw_name = (row.get("seller name") or "").strip()
+            seller_id = (row.get("seller id") or "").strip()
+            clean_name = extract_clean_company_name(raw_name)
+            if not clean_name and raw_name and raw_name.lower() != "null":
+                clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
+
+            domain = extract_company_domain_from_email(row.get("seller email") or "")
+            seller_key = seller_id if seller_id and seller_id.lower() != "null" else (clean_name or raw_name or f"row:{idx}").lower()
+
+            print(f"\n📍 [S5] row #{idx} | seller: {clean_name or raw_name or 'N/A'} | domain: {domain or 'none'}")
+
+            # Reuse cached result for repeated seller rows to avoid extra Apollo/GPT cost.
+            if seller_key in seller_cache:
+                cache_hits += 1
+                cached = seller_cache[seller_key]
+                if cached is None:
+                    print("   ♻️  Cached skip for this seller")
+                    skipped += 1
+                    continue
+                apollo_name, apollo_title, apollo_email = cached
+                out = {h: row.get(h, "") for h in STAGE4_HEADERS}
+                out["apollo name"] = apollo_name
+                out["apollo title"] = apollo_title
+                out["apollo email"] = apollo_email
+                buf.append(out)
+                if len(buf) >= batch_size:
+                    flush_rows(CONFIG["STAGE5_OUTPUT_CSV"], STAGE5_HEADERS, buf, mode)
+                    written += len(buf)
+                    print(f"   ✍️  Flushed {len(buf)} rows (total written: {written})")
+                    buf = []
+                    mode = "a"
+                continue
+
+            if not domain and not (clean_name or "").strip():
+                print("   ⏭️  Skip: no company name and no usable domain")
+                seller_cache[seller_key] = None
+                skipped += 1
+                continue
+
+            org = apollo_search_company(domain, clean_name or raw_name)
+            time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
+            if not org or not isinstance(org, dict) or not org.get("id"):
+                print("   ⏭️  Skip: no Apollo organization")
+                seller_cache[seller_key] = None
+                skipped += 1
+                continue
+
+            org_id = org.get("id")
+            people = apollo_list_people(org_id)
+            time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
+            if not people:
+                print("   ⏭️  Skip: no people on organization")
+                seller_cache[seller_key] = None
+                skipped += 1
+                continue
+
+            people_lines: List[Tuple[str, str]] = []
+            for p in people:
+                if not isinstance(p, dict):
+                    continue
+                pid = (p.get("id") or "").strip()
+                tit = (p.get("title") or "").strip()
+                if pid and tit:
+                    people_lines.append((pid, tit))
+            if not people_lines:
+                print("   ⏭️  Skip: no id/title pairs")
+                seller_cache[seller_key] = None
+                skipped += 1
+                continue
+
+            gpt_raw = call_gpt_stage5_rank_people(clean_name or raw_name or "", people_lines)
+            picks = parse_stage5_gpt_people(gpt_raw)
+            if not picks:
+                print("   ⏭️  Skip: GPT found no suitable contacts")
+                seller_cache[seller_key] = None
+                skipped += 1
+                continue
+
+            ordered_ids = [p[0] for p in picks]
+            matched = pick_verified_apollo_contact(ordered_ids)
+            if not matched:
+                print("   ⏭️  Skip: no verified Apollo email on top picks")
+                seller_cache[seller_key] = None
+                skipped += 1
+                continue
+
+            apollo_name, apollo_title, apollo_email = matched
+            seller_cache[seller_key] = (apollo_name, apollo_title, apollo_email)
+            out = {h: row.get(h, "") for h in STAGE4_HEADERS}
+            out["apollo name"] = apollo_name
+            out["apollo title"] = apollo_title
+            out["apollo email"] = apollo_email
+            buf.append(out)
+
+            if len(buf) >= batch_size:
+                flush_rows(CONFIG["STAGE5_OUTPUT_CSV"], STAGE5_HEADERS, buf, mode)
+                written += len(buf)
+                print(f"   ✍️  Flushed {len(buf)} rows (total written: {written})")
+                buf = []
+                mode = "a"
+
+    if buf:
+        flush_rows(CONFIG["STAGE5_OUTPUT_CSV"], STAGE5_HEADERS, buf, mode)
+        written += len(buf)
+        print(f"   ✍️  Final flush {len(buf)} rows (total written: {written})")
+
+    print(f"\n✅ STAGE 5 complete. Rows written: {written} | Skipped: {skipped} | Cache hits: {cache_hits}")
+
+
 def main():
     start = time.time()
     print("\n" + "=" * 90)
-    print("AMAZON SELLER PIPELINE (4 STAGES)")
+    print("AMAZON SELLER PIPELINE (5 STAGES)")
     print("=" * 90)
     print(f"🔎 Keyword: {CONFIG['KEYWORD']}")
     print(f"📄 Pages:   {CONFIG['TOTAL_PAGES']}")
@@ -686,12 +1145,14 @@ def main():
     print(f"📁 S2:      {CONFIG['STAGE2_OUTPUT_CSV']}")
     print(f"📁 S3 main: {CONFIG['STAGE3_OUTPUT_CSV']}")
     print(f"📁 S3 wipe: {CONFIG['STAGE3_WIPED_OUTPUT_CSV']}")
-    print(f"📁 Final:   {CONFIG['FINAL_OUTPUT_CSV']}")
+    print(f"📁 Final:   {CONFIG['STAGE4_OUTPUT_CSV']}")
+    print(f"📁 S5:      {CONFIG['STAGE5_OUTPUT_CSV']}")
 
     stage1()
     stage2()
     stage3()
     stage4()
+    stage5()
 
     elapsed = time.time() - start
     print("\n" + "=" * 90)
@@ -707,12 +1168,17 @@ if __name__ == "__main__":
     # Fixed prefix for this script: SELLER_*
     override_from_env(CONFIG, env_prefix="SELLER_")
 
+    load_public_email_domains()
+
     API_KEY = (os.getenv("API_KEY") or "").strip()
     if not API_KEY:
         raise ValueError("API_KEY not found in .env file.")
     OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY not found in .env file.")
+    APOLLO_API_KEY = (os.getenv("APOLLO_API_KEY") or "").strip()
+    if not APOLLO_API_KEY:
+        raise ValueError("APOLLO_API_KEY not found in .env file.")
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 

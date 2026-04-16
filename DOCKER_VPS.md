@@ -160,7 +160,7 @@ docker compose run --rm app python phone_clean.py
 # Alternative: run reseller 3-stage pipeline
 docker compose run --rm app python amazon_resellers_pipeline.py
 
-# Alternative: run seller 4-stage pipeline
+# Alternative: run seller 5-stage pipeline (needs APOLLO_API_KEY in .env)
 docker compose run --rm app python amazon_seller_pipeline.py
 ```
 
@@ -374,9 +374,19 @@ All important settings can be overridden with **environment variables**. The scr
 | `SELLER_STAGE2_WRITE_BATCH_SIZE` | `100`                          | Stage 2 CSV flush size.                                                     |
 | `SELLER_STAGE3_WRITE_BATCH_SIZE` | `100`                          | Stage 3 CSV flush size.                                                     |
 | `SELLER_STAGE4_BATCH_SIZE`       | `10`                           | Rows per GPT request in Stage 4 (whole batch retried up to 3 times).        |
+| `SELLER_STAGE5_OUTPUT_CSV`       | `data/seller_stage5.csv`       | Stage 5 Apollo-enriched output (subset of rows that match + verified email). |
+| `SELLER_STAGE5_WRITE_BATCH_SIZE` | `50`                         | Flush size for Stage 5 output CSV.                                          |
+| `SELLER_APOLLO_API_TIMEOUT`      | `60`                           | Apollo HTTP timeout (seconds).                                              |
+| `SELLER_APOLLO_HTTP_RETRIES`     | `3`                            | Retries per Apollo request on failure.                                      |
 | `SELLER_MODEL`                   | `gpt-5-mini`                   | OpenAI model for Stage 4 extraction.                                        |
 | `SELLER_REASONING_EFFORT`        | `medium`                       | OpenAI reasoning effort for Stage 4.                                        |
 | `SELLER_MAX_OUTPUT_TOKENS`       | `5000`                         | Max tokens for Stage 4 GPT response.                                        |
+
+**Apollo (Stage 5, not `SELLER_` prefixed)**
+
+| Variable        | Example   | Description                          |
+| --------------- | --------- | ------------------------------------ |
+| `APOLLO_API_KEY` | `xxxxx` | Header `x-api-key` for Apollo.io API. |
 
 
 Paths in the container are under `/app/data`; the host directory `./data` is mounted there, so use `data/...` in these variables.
