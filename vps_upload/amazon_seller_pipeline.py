@@ -317,8 +317,10 @@ def apollo_post(path, json_body=None, params=None):
 
 def apollo_search_company(domain, company_name: str):
     """
-    Return company object with at least {"id": ...} or None.
-    Fallback supported: when organizations[] is empty but accounts[] contains organization_id.
+    Return first organization payload for next step:
+    - normal case: {"id": "<org_id>", ...}
+    - fallback case when organizations empty but accounts has organization_id:
+      returns {"id": "<organization_id from account>", "_from_account": True}
     """
     path = "/mixed_companies/search"
     if domain:
@@ -331,15 +333,15 @@ def apollo_search_company(domain, company_name: str):
     if not data:
         return None
     orgs = data.get("organizations") or []
-    if orgs and isinstance(orgs[0], dict) and orgs[0].get("id"):
+    if orgs:
         return orgs[0]
-
-    # Fallback: some responses return only accounts with organization_id.
+    # Fallback: some responses return accounts with organization_id but empty organizations.
     accounts = data.get("accounts") or []
-    if accounts and isinstance(accounts[0], dict):
-        oid = (accounts[0].get("organization_id") or "").strip()
+    if accounts:
+        first = accounts[0] if isinstance(accounts[0], dict) else {}
+        oid = (first.get("organization_id") or "").strip()
         if oid:
-            return {"id": oid}
+            return {"id": oid, "_from_account": True}
     return None
 
 
@@ -631,7 +633,10 @@ Rules:
 - You receive two texts per row: "seller about" and "seller description" (may be empty or "null").
 - Use ONLY those two texts. No web search, no tools, no outside knowledge, no guessing.
 - Do NOT invent names, emails, phone numbers, or titles. If a value is not explicitly present in the texts, output null for that field.
-- For "person in charge" and "person title": only extract when the text clearly states a named individual and their role (e.g. Geschäftsführer: Max Mustermann). If only a role label exists without a clear person name, use null for person and optionally the role word as title only if it appears verbatim next to a name pattern; when unsure, use null.
+- For "person in charge" and "person title": return exactly ONE person.
+- If multiple people are present, choose only the single person most relevant to Amazon listings / marketplace / e-commerce / marketing / brand content / visual or creative ownership.
+- The "seller person title" must be the title/role of that same chosen person as written in the text (or a close trimmed form), not another person's title.
+- If only role labels exist without a clear person name, use null for person and null for title.
 - Output exactly one CSV line per input row.
 - Format exactly: Nr;seller email;seller number;seller incharge person;seller person title
 - If not found, use null for that field (lowercase).
@@ -1019,100 +1024,78 @@ def stage5():
     batch_size = int(CONFIG["STAGE5_WRITE_BATCH_SIZE"])
     skipped = 0
     cache_hits = 0
-    # seller_key -> tuple(apollo_name, apollo_title, apollo_email) | None (means previously skipped)
+    # seller_key -> (apollo_name, apollo_title, apollo_email)
+    # values can be all-null to avoid reprocessing failed sellers
     seller_cache = {}
 
     with open(CONFIG["STAGE4_OUTPUT_CSV"], "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for idx, row in enumerate(reader, 1):
             raw_name = (row.get("seller name") or "").strip()
-            seller_id = (row.get("seller id") or "").strip()
             clean_name = extract_clean_company_name(raw_name)
             if not clean_name and raw_name and raw_name.lower() != "null":
                 clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
 
             domain = extract_company_domain_from_email(row.get("seller email") or "")
-            seller_key = seller_id if seller_id and seller_id.lower() != "null" else (clean_name or raw_name or f"row:{idx}").lower()
 
             print(f"\n📍 [S5] row #{idx} | seller: {clean_name or raw_name or 'N/A'} | domain: {domain or 'none'}")
 
-            # Reuse cached result for repeated seller rows to avoid extra Apollo/GPT cost.
+            seller_id = (row.get("seller id") or "").strip()
+            seller_key = f"id:{seller_id.lower()}" if seller_id and seller_id.lower() != "null" else f"name:{(clean_name or raw_name).strip().lower()}"
+
             if seller_key in seller_cache:
+                apollo_name, apollo_title, apollo_email = seller_cache[seller_key]
                 cache_hits += 1
-                cached = seller_cache[seller_key]
-                if cached is None:
-                    print("   ♻️  Cached skip for this seller")
+                print("   ♻️  Reused cached seller result")
+            else:
+                apollo_name = apollo_title = apollo_email = "null"
+
+                if not domain and not (clean_name or "").strip():
+                    print("   ⏭️  Skip: no company name and no usable domain")
                     skipped += 1
-                    continue
-                apollo_name, apollo_title, apollo_email = cached
-                out = {h: row.get(h, "") for h in STAGE4_HEADERS}
-                out["apollo name"] = apollo_name
-                out["apollo title"] = apollo_title
-                out["apollo email"] = apollo_email
-                buf.append(out)
-                if len(buf) >= batch_size:
-                    flush_rows(CONFIG["STAGE5_OUTPUT_CSV"], STAGE5_HEADERS, buf, mode)
-                    written += len(buf)
-                    print(f"   ✍️  Flushed {len(buf)} rows (total written: {written})")
-                    buf = []
-                    mode = "a"
-                continue
+                else:
+                    org = apollo_search_company(domain, clean_name or raw_name)
+                    time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
+                    if not org or not isinstance(org, dict) or not org.get("id"):
+                        print("   ⏭️  Skip: no Apollo organization")
+                        skipped += 1
+                    else:
+                        org_id = org.get("id")
+                        people = apollo_list_people(org_id)
+                        time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
+                        if not people:
+                            print("   ⏭️  Skip: no people on organization")
+                            skipped += 1
+                        else:
+                            people_lines: List[Tuple[str, str]] = []
+                            for p in people:
+                                if not isinstance(p, dict):
+                                    continue
+                                pid = (p.get("id") or "").strip()
+                                tit = (p.get("title") or "").strip()
+                                if pid and tit:
+                                    people_lines.append((pid, tit))
+                            if not people_lines:
+                                print("   ⏭️  Skip: no id/title pairs")
+                                skipped += 1
+                            else:
+                                gpt_raw = call_gpt_stage5_rank_people(clean_name or raw_name or "", people_lines)
+                                picks = parse_stage5_gpt_people(gpt_raw)
+                                if not picks:
+                                    print("   ⏭️  Skip: GPT found no suitable contacts")
+                                    skipped += 1
+                                else:
+                                    ordered_ids = [p[0] for p in picks]
+                                    matched = pick_verified_apollo_contact(ordered_ids)
+                                    if not matched:
+                                        print("   ⏭️  Skip: no verified Apollo email on top picks")
+                                        skipped += 1
+                                    else:
+                                        apollo_name, apollo_title, apollo_email = matched
 
-            if not domain and not (clean_name or "").strip():
-                print("   ⏭️  Skip: no company name and no usable domain")
-                seller_cache[seller_key] = None
-                skipped += 1
-                continue
+                # Cache both success and skip(null) results to avoid duplicate API cost per seller
+                seller_cache[seller_key] = (apollo_name, apollo_title, apollo_email)
 
-            org = apollo_search_company(domain, clean_name or raw_name)
-            time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
-            if not org or not isinstance(org, dict) or not org.get("id"):
-                print("   ⏭️  Skip: no Apollo organization")
-                seller_cache[seller_key] = None
-                skipped += 1
-                continue
-
-            org_id = org.get("id")
-            people = apollo_list_people(org_id)
-            time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
-            if not people:
-                print("   ⏭️  Skip: no people on organization")
-                seller_cache[seller_key] = None
-                skipped += 1
-                continue
-
-            people_lines: List[Tuple[str, str]] = []
-            for p in people:
-                if not isinstance(p, dict):
-                    continue
-                pid = (p.get("id") or "").strip()
-                tit = (p.get("title") or "").strip()
-                if pid and tit:
-                    people_lines.append((pid, tit))
-            if not people_lines:
-                print("   ⏭️  Skip: no id/title pairs")
-                seller_cache[seller_key] = None
-                skipped += 1
-                continue
-
-            gpt_raw = call_gpt_stage5_rank_people(clean_name or raw_name or "", people_lines)
-            picks = parse_stage5_gpt_people(gpt_raw)
-            if not picks:
-                print("   ⏭️  Skip: GPT found no suitable contacts")
-                seller_cache[seller_key] = None
-                skipped += 1
-                continue
-
-            ordered_ids = [p[0] for p in picks]
-            matched = pick_verified_apollo_contact(ordered_ids)
-            if not matched:
-                print("   ⏭️  Skip: no verified Apollo email on top picks")
-                seller_cache[seller_key] = None
-                skipped += 1
-                continue
-
-            apollo_name, apollo_title, apollo_email = matched
-            seller_cache[seller_key] = (apollo_name, apollo_title, apollo_email)
             out = {h: row.get(h, "") for h in STAGE4_HEADERS}
             out["apollo name"] = apollo_name
             out["apollo title"] = apollo_title
