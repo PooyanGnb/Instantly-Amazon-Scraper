@@ -14,6 +14,7 @@ Run the scripts in this order. Each step uses the output of the previous one (or
 | **2** | **gpt.py**    | Enriched CSV (e.g. `Bunch 3 - Amazon.csv`) | Final CSV (e.g. `Bunch 3 - Final.csv`) |
 | **3** | **phone_clean.py** | Final CSV (e.g. `Bunch 3 - Final.csv`) | Ready CSV (e.g. `Bunch 3 - Ready.csv`) |
 | **Alt flow** | **amazon_resellers_pipeline.py** | CSV with `Amazon Link` | Final reseller CSV (`Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`) |
+| **Alt flow** | **amazon_seller_niche_pipeline.py** | CSV/XLSX with `Seller ID` + `Seller Link` + lead columns | CSV/XLSX with niche rank + text contact + Apollo contact columns |
 
 **One-line summary:**  
 Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **phone_clean.py** (clean phones) → ready for use (e.g. email campaigns).
@@ -92,11 +93,21 @@ In project root, create `.env` with:
 ```env
 API_KEY=your_web_scraping_api_key
 OPENAI_API_KEY=your_openai_api_key
+APOLLO_API_KEY=your_apollo_api_key
+
+# New seller niche pipeline (amazon_seller_niche_pipeline.py)
+SELLERNICHE_INPUT_FILE=data/seller_niche_input.csv
+SELLERNICHE_STAGE1_OUTPUT_FILE=data/seller_niche_stage1.csv
+SELLERNICHE_STAGE2_OUTPUT_FILE=data/seller_niche_stage2.csv
+SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true
+SELLERNICHE_AMAZON_DOMAIN=amazon.de
+SELLERNICHE_MODEL=gpt-5-mini
 ```
 
 - **main.py** uses `API_KEY`.
 - **gpt.py** uses `OPENAI_API_KEY`.
 - **phone_clean.py** does not use `.env`.
+- **amazon_seller_niche_pipeline.py** uses `API_KEY`, `OPENAI_API_KEY`, and `SELLERNICHE_*` overrides; `APOLLO_API_KEY` is required only when `SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true`.
 
 ### CSV structure (flexible)
 
@@ -146,3 +157,11 @@ You can override all important settings with **environment variables** (no code 
 1. Set `.env` keys for `amazon_resellers_pipeline.py` (input + stage outputs + final output).
 2. Run `python amazon_resellers_pipeline.py`.
 3. Use `FINAL_OUTPUT_CSV` (contains input columns + Product1/2 links + Product1/2 cleaned names).
+
+### Alternative seller niche flow
+
+1. Prepare a CSV/XLSX with headers: `Seller ID`, `Seller Link`, `PL URL`, `Seller Name`, `Website`, `Estimated Monthly Revenue`, `First Name`, `Last Name`, `Title`, `Email`, `Source`, `Phone Number`, `Country`, `State`.
+2. Set `.env` keys with `SELLERNICHE_` prefix (at least input/output paths).
+3. Run `python amazon_seller_niche_pipeline.py`.
+4. Stage 1 output: input columns + `niche rank` (streamed writes).
+5. Stage 2 output: input columns + `niche rank`, `text email`, `text number`, `text name`, `text title`, `apollo name`, `apollo title`, `apollo email` (streamed writes).

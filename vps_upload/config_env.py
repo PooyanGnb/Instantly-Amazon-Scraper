@@ -60,7 +60,7 @@ def override_from_env(config, env_prefix=""):
                     config[key] = float(val.replace(",", "."))
                 except (ValueError, TypeError):
                     pass
-        elif key in ("USE_WEB_SEARCH",):
+        elif key in ("USE_WEB_SEARCH", "RUN_STAGE2_PERSON_STAGE"):
             config[key] = _bool(val)
         elif key in ("COLUMN_SELLER_ID", "COLUMN_SELLER_NAME", "COLUMN_PRODUCT_NAME", "COLUMN_PRODUCT_DESCRIPTION"):
             config[key] = [c.strip() for c in val.split(",") if c.strip()]

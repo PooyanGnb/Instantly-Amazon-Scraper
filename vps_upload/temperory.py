@@ -52,6 +52,7 @@ CONFIG = {
     "APOLLO_BASE_URL": "https://api.apollo.io/api/v1",
     "APOLLO_API_TIMEOUT": 60,
     "APOLLO_HTTP_RETRIES": 3,
+    "APOLLO_SEARCH_BY_NAME_FALLBACK": False,
 
     # GPT
     "MODEL": "gpt-5-mini",
@@ -122,6 +123,7 @@ def wire_config_into_seller_pipeline():
         "APOLLO_BASE_URL",
         "APOLLO_API_TIMEOUT",
         "APOLLO_HTTP_RETRIES",
+        "APOLLO_SEARCH_BY_NAME_FALLBACK",
         "MODEL",
         "REASONING_EFFORT",
         "MAX_OUTPUT_TOKENS",

@@ -88,6 +88,7 @@ CONFIG = {
     "APOLLO_BASE_URL": "https://api.apollo.io/api/v1",
     "APOLLO_API_TIMEOUT": 60,
     "APOLLO_HTTP_RETRIES": 3,
+    "APOLLO_SEARCH_BY_NAME_FALLBACK": False,
 
     # GPT settings
     "MODEL": "gpt-5-mini",
@@ -325,11 +326,13 @@ def apollo_search_company(domain, company_name: str):
     path = "/mixed_companies/search"
     if domain:
         data = apollo_post(path, json_body={"q_organization_domains_list": [domain]})
-    else:
+    elif CONFIG.get("APOLLO_SEARCH_BY_NAME_FALLBACK", False):
         qn = (company_name or "").strip()
         if not qn:
             return None
         data = apollo_post(path, json_body={"q_organization_name": qn})
+    else:
+        return None
     if not data:
         return None
     orgs = data.get("organizations") or []
@@ -1050,8 +1053,8 @@ def stage5():
             else:
                 apollo_name = apollo_title = apollo_email = "null"
 
-                if not domain and not (clean_name or "").strip():
-                    print("   ⏭️  Skip: no company name and no usable domain")
+                if not domain:
+                    print("   ⏭️  Skip: no usable company domain (name-search disabled)")
                     skipped += 1
                 else:
                     org = apollo_search_company(domain, clean_name or raw_name)

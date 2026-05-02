@@ -56,10 +56,22 @@ API_KEY=your_web_scraping_api_key
 
 # OpenAI (used by gpt.py)
 OPENAI_API_KEY=your_openai_api_key
+
+# Apollo (used by seller pipelines with Apollo stage)
+APOLLO_API_KEY=your_apollo_api_key
+
+# New seller niche pipeline config prefix (amazon_seller_niche_pipeline.py)
+SELLERNICHE_INPUT_FILE=data/seller_niche_input.csv
+SELLERNICHE_STAGE1_OUTPUT_FILE=data/seller_niche_stage1.csv
+SELLERNICHE_STAGE2_OUTPUT_FILE=data/seller_niche_stage2.csv
+SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true
+SELLERNICHE_AMAZON_DOMAIN=amazon.de
+SELLERNICHE_MODEL=gpt-5-mini
 ```
 
 - **main.py** needs `API_KEY` for [Web Scraping API](https://www.webscrapingapi.com/) (Amazon seller/products).
 - **gpt.py** needs `OPENAI_API_KEY` for OpenAI (e.g. GPT).
+- **amazon_seller_niche_pipeline.py** needs `API_KEY` and `OPENAI_API_KEY`. It needs `APOLLO_API_KEY` only when `SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true` (person + Apollo stage).
 
 ## Usage
 
@@ -113,6 +125,23 @@ python amazon_resellers_pipeline.py
 ```
 
 Configure through `.env` using the same `config_env.py` style as other scripts (`none/null/empty` supported for nullable numeric keys).
+
+## Alternative Flow: Seller Niche + Contact Pipeline
+
+Use `amazon_seller_niche_pipeline.py` when your input has seller lead columns including `Seller ID` and `Seller Link`.
+
+- Reads CSV or XLSX input.
+- Extracts ASIN/product id from `Seller Link`, calls product endpoint, and GPT classifies `niche rank` (`good`, `neutral`, `bad`) from title/rating/review count.
+- Writes Stage 1 output in real time: input headers + `niche rank`.
+- Calls seller profile endpoint by `Seller ID`, extracts seller about/description, and GPT extracts one text contact (`text email`, `text number`, `text name`, `text title`).
+- Runs Apollo enrichment with domain from text email and writes `apollo name`, `apollo title`, `apollo email` (verified).
+- Writes Stage 2 output in real time: input headers + `niche rank` + text/apollo fields.
+
+Run:
+
+```bash
+python amazon_seller_niche_pipeline.py
+```
 
 
 ## Configuration summary
