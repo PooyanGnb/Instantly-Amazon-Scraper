@@ -72,6 +72,7 @@ SELLERNICHE_MODEL=gpt-5-mini
 - **main.py** needs `API_KEY` for [Web Scraping API](https://www.webscrapingapi.com/) (Amazon seller/products).
 - **gpt.py** needs `OPENAI_API_KEY` for OpenAI (e.g. GPT).
 - **amazon_seller_niche_pipeline.py** needs `API_KEY` and `OPENAI_API_KEY`. It needs `APOLLO_API_KEY` only when `SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true` (person + Apollo stage).
+- **company_apollo_enrich.py** needs `OPENAI_API_KEY` and `APOLLO_API_KEY` (no Web Scraping API).
 
 ## Usage
 
@@ -143,6 +144,49 @@ Run:
 python amazon_seller_niche_pipeline.py
 ```
 
+## Alternative Flow: Company Apollo Enrichment
+
+Use `company_apollo_enrich.py` for a CSV with **Company Name**, **Website**, and optional **Email** (separate columns). No Amazon API.
+
+- Resolves company domain from **Website** first; uses **Email** only when website is empty (and `APOLLOCOMPANY_COLUMN_EMAIL` is set in `.env`).
+- Apollo: find organization → list employees → GPT ranks up to 3 suitable contacts (same rules as seller pipeline Stage 5).
+- Returns the first GPT pick with a **verified** Apollo email; stores Apollo `person id` from the match response.
+- Optional phone: `APOLLOCOMPANY_REVEAL_PHONE_NUMBER=true` + `APOLLOCOMPANY_WEBHOOK_URL` — `people/match` gets `reveal_phone_number` and `webhook_url`; `person phone` stays `null` until your webhook fills it later.
+- Output: all input columns + `person name`, `person title`, `person email`, `person phone`, `person id`.
+
+```bash
+python company_apollo_enrich.py
+```
+
+Example `.env`:
+
+```env
+OPENAI_API_KEY=...
+APOLLO_API_KEY=...
+APOLLOCOMPANY_INPUT_CSV=data/company_leads.csv
+APOLLOCOMPANY_OUTPUT_CSV=data/company_leads_apollo.csv
+# APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK=true
+# APOLLOCOMPANY_COLUMN_COMPANY_NAME=Company Name,company name
+# APOLLOCOMPANY_COLUMN_WEBSITE=Website,website
+# APOLLOCOMPANY_COLUMN_EMAIL=Email,email
+# APOLLOCOMPANY_COLUMN_EMAIL=
+APOLLOCOMPANY_REVEAL_PHONE_NUMBER=false
+APOLLOCOMPANY_WEBHOOK_URL=
+```
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `APOLLOCOMPANY_INPUT_CSV` | `data/company_leads.csv` | Input CSV |
+| `APOLLOCOMPANY_OUTPUT_CSV` | `data/company_leads_apollo.csv` | Output CSV |
+| `APOLLOCOMPANY_MODEL` | `gpt-5-mini` | OpenAI model |
+| `APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK` | `false` | Search Apollo by name when domain missing |
+| `APOLLOCOMPANY_SKIP_EXISTING` | `true` | Skip rows already enriched in output |
+| `APOLLOCOMPANY_WRITE_BATCH_SIZE` | `50` | Rows per CSV flush |
+| `APOLLOCOMPANY_COLUMN_COMPANY_NAME` | `Company Name,company name,...` | Header aliases |
+| `APOLLOCOMPANY_COLUMN_WEBSITE` | `Website,website` | Website header aliases |
+| `APOLLOCOMPANY_COLUMN_EMAIL` | *(empty = disabled)* | Email header aliases; empty env disables email fallback |
+| `APOLLOCOMPANY_REVEAL_PHONE_NUMBER` | `false` | Request Apollo phone reveal via webhook on `people/match` |
+| `APOLLOCOMPANY_WEBHOOK_URL` | *(empty)* | Required when reveal is true; Apollo POSTs phone data here later |
 
 ## Configuration summary
 

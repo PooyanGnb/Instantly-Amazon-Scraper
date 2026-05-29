@@ -44,6 +44,7 @@ def override_from_env(config, env_prefix=""):
                    "BATCH_SIZE", "MAX_OUTPUT_TOKENS", "MAX_TOOL_CALLS", "WAIT_BETWEEN_BATCHES",
                    "STAGE1_WRITE_BATCH_SIZE", "STAGE2_WRITE_BATCH_SIZE", "STAGE3_BATCH_SIZE",
                    "STAGE3_WRITE_BATCH_SIZE", "STAGE4_BATCH_SIZE", "STAGE5_WRITE_BATCH_SIZE",
+                   "WRITE_BATCH_SIZE",
                    "APOLLO_API_TIMEOUT", "APOLLO_HTTP_RETRIES", "SEARCH_MAX_RESULTS"):
             # Var is present and set to none/null/empty → set config to None (e.g. no start line limit)
             if val.lower() in ("none", "null", ""):
@@ -60,9 +61,23 @@ def override_from_env(config, env_prefix=""):
                     config[key] = float(val.replace(",", "."))
                 except (ValueError, TypeError):
                     pass
-        elif key in ("USE_WEB_SEARCH", "RUN_STAGE2_PERSON_STAGE"):
+        elif key in (
+            "USE_WEB_SEARCH",
+            "RUN_STAGE2_PERSON_STAGE",
+            "APOLLO_SEARCH_BY_NAME_FALLBACK",
+            "SKIP_EXISTING",
+            "REVEAL_PHONE_NUMBER",
+        ):
             config[key] = _bool(val)
-        elif key in ("COLUMN_SELLER_ID", "COLUMN_SELLER_NAME", "COLUMN_PRODUCT_NAME", "COLUMN_PRODUCT_DESCRIPTION"):
+        elif key in (
+            "COLUMN_SELLER_ID",
+            "COLUMN_SELLER_NAME",
+            "COLUMN_PRODUCT_NAME",
+            "COLUMN_PRODUCT_DESCRIPTION",
+            "COLUMN_COMPANY_NAME",
+            "COLUMN_WEBSITE",
+            "COLUMN_EMAIL",
+        ):
             config[key] = [c.strip() for c in val.split(",") if c.strip()]
         else:
             config[key] = val

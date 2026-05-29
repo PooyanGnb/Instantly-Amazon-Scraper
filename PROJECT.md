@@ -15,6 +15,7 @@ Run the scripts in this order. Each step uses the output of the previous one (or
 | **3** | **phone_clean.py** | Final CSV (e.g. `Bunch 3 - Final.csv`) | Ready CSV (e.g. `Bunch 3 - Ready.csv`) |
 | **Alt flow** | **amazon_resellers_pipeline.py** | CSV with `Amazon Link` | Final reseller CSV (`Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`) |
 | **Alt flow** | **amazon_seller_niche_pipeline.py** | CSV/XLSX with `Seller ID` + `Seller Link` + lead columns | CSV/XLSX with niche rank + text contact + Apollo contact columns |
+| **Alt flow** | **company_apollo_enrich.py** | CSV with `Company Name` + `Website` or email | Same columns + `person name`, `person title`, `person email`, `person phone`, `person id` |
 
 **One-line summary:**  
 Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **phone_clean.py** (clean phones) → ready for use (e.g. email campaigns).
@@ -108,6 +109,7 @@ SELLERNICHE_MODEL=gpt-5-mini
 - **gpt.py** uses `OPENAI_API_KEY`.
 - **phone_clean.py** does not use `.env`.
 - **amazon_seller_niche_pipeline.py** uses `API_KEY`, `OPENAI_API_KEY`, and `SELLERNICHE_*` overrides; `APOLLO_API_KEY` is required only when `SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true`.
+- **company_apollo_enrich.py** uses `OPENAI_API_KEY`, `APOLLO_API_KEY`, and `APOLLOCOMPANY_*` overrides (no Web Scraping API).
 
 ### CSV structure (flexible)
 
@@ -165,3 +167,20 @@ You can override all important settings with **environment variables** (no code 
 3. Run `python amazon_seller_niche_pipeline.py`.
 4. Stage 1 output: input columns + `niche rank` (streamed writes).
 5. Stage 2 output: input columns + `niche rank`, `text email`, `text number`, `text name`, `text title`, `apollo name`, `apollo title`, `apollo email` (streamed writes).
+
+### Alternative company Apollo flow
+
+Use **`company_apollo_enrich.py`** when you have a plain company list (no Amazon scrape): **Company Name**, **Website**, and optional **Email** as separate columns.
+
+1. Put your CSV in the project (e.g. `data/company_leads.csv`). All original columns are kept.
+2. In `.env` set `APOLLOCOMPANY_INPUT_CSV`, `APOLLOCOMPANY_OUTPUT_CSV`, plus `OPENAI_API_KEY` and `APOLLO_API_KEY`.
+3. Run `python company_apollo_enrich.py`.
+4. Output adds: `person name`, `person title`, `person email`, `person phone`, `person id` (best of up to 3 GPT-ranked Apollo contacts with verified email; `null` when none).
+
+**Domain rules:** **Website** is used first when the row has a non-empty website value (`http`/`https`/`www` and paths stripped to a host like `link.com`). **Email** domain is used only when website is empty and `APOLLOCOMPANY_COLUMN_EMAIL` is set in `.env` (leave empty to disable email entirely). Public mail domains are rejected via `public_email_domains.txt`. Optional `APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK=true` when no domain is available.
+
+**Phone reveal (optional):** `APOLLOCOMPANY_REVEAL_PHONE_NUMBER=true` requires `APOLLOCOMPANY_WEBHOOK_URL`. The script sends `reveal_phone_number` and `webhook_url` on `people/match`; `person phone` is written as `null` until Apollo posts the number to your webhook. Use `person id` (Apollo `id` from the match response) to correlate callback data with CSV rows. A webhook receiver that auto-updates the CSV is not included in this repo.
+
+**Column aliases** (first match wins): `APOLLOCOMPANY_COLUMN_COMPANY_NAME`, `APOLLOCOMPANY_COLUMN_WEBSITE`, `APOLLOCOMPANY_COLUMN_EMAIL` (comma-separated lists).
+
+**Resume:** `APOLLOCOMPANY_SKIP_EXISTING=true` (default) skips rows already in the output file with a non-null `person email` (matched by company + website + email); new rows are appended.
