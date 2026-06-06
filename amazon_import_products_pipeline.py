@@ -16,7 +16,7 @@ Stage 3:
 - Cache by Scraped Seller ID; wiped = region failures only
 
 Stage 4:
-- GPT extract contacts from seller about + description
+- GPT extract contacts from seller about + description (one GPT call per unique seller)
 
 Stage 5:
 - Apollo domain search; match Stage 4 person + GPT outreach pick
@@ -153,6 +153,10 @@ Rules:
 - If no title is present for any person, choose the first named person in the text.
 - The "seller person title" must be the title/role of that same chosen person as written in the text (or a close trimmed form), not another person's title.
 - If only role labels exist without a clear person name, use null for person and null for title.
+- When multiple emails or phone numbers appear, pick exactly ONE email and ONE phone for the chosen person.
+- Prefer extracting both email and phone from the SAME section (seller about OR seller description) when that section contains both for the chosen person.
+- If only one of email/phone exists in that section, take the missing field from the other section.
+- If multiple emails or phones exist without a clear person link, still prefer a pair from the same section before mixing across sections.
 - Output exactly one CSV line per input row.
 - Format exactly: Nr;seller email;seller number;seller incharge person;seller person title
 - If not found, use null for that field (lowercase).
@@ -355,6 +359,17 @@ def scraped_seller_id_cache_key(row: dict) -> str:
     """Lowercase seller ID for in-memory dedup cache only."""
     raw = scraped_seller_id_raw(row)
     return raw.lower() if raw else ""
+
+
+def seller_dedup_key(row: dict) -> str:
+    seller_id = scraped_seller_id_cache_key(row)
+    if seller_id:
+        return f"id:{seller_id}"
+    raw_name = (row.get("Scraped Seller Name") or row.get("Seller") or "").strip()
+    clean_name = seller_sp.extract_clean_company_name(raw_name)
+    if not clean_name and raw_name and raw_name.lower() != "null":
+        clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
+    return f"name:{normalize_name_key(clean_name or raw_name)}"
 
 
 def normalize_person_name(name: str) -> str:
@@ -685,44 +700,82 @@ def stage4():
     base_out_headers = [h for h in base_headers if h not in drop_cols]
     headers = build_headers(base_out_headers, STAGE4_EXTRA)
 
-    mode = "w"
-    written = 0
-    gpt_batch = []
+    representatives: Dict[str, dict] = {}
+    for row in rows:
+        key = seller_dedup_key(row)
+        if key not in representatives:
+            representatives[key] = row
+
+    seller_gpt_cache: Dict[str, Tuple[str, str, str, str]] = {}
+    gpt_batch: List[dict] = []
+    gpt_keys: List[str] = []
     batch_size = int(CONFIG["STAGE4_BATCH_SIZE"])
 
-    def flush_gpt_batch(items: List[dict]):
-        nonlocal mode, written
+    def flush_gpt_batch(items: List[dict], keys: List[str]):
         if not items:
             return
-        print(f"\n   🤖 Calling GPT for {len(items)} rows...")
+        print(f"\n   🤖 Calling GPT for {len(items)} unique sellers...")
         parsed = call_gpt_stage4_with_retry(items)
-        batch_rows = []
-        for i, row in enumerate(items):
+        for i, key in enumerate(keys):
             email, phone, incharge, title = parsed[i]
-            out = {h: row.get(h, "null") for h in base_out_headers}
-            out["seller email"] = seller_sp.gpt_text_field(email)
-            out["seller number"] = seller_sp.phone_for_sheet(phone)
-            out["seller incharge person"] = seller_sp.gpt_text_field(incharge)
-            out["seller person title"] = seller_sp.gpt_text_field(title)
-            batch_rows.append(out)
-
-        flush_rows(CONFIG["STAGE4_OUTPUT_CSV"], headers, batch_rows, mode)
-        written += len(batch_rows)
-        print(f"   ✍️  Flushed {len(batch_rows)} rows after GPT run (total written: {written})")
-        mode = "a"
+            seller_gpt_cache[key] = (
+                seller_sp.gpt_text_field(email),
+                seller_sp.phone_for_sheet(phone),
+                seller_sp.gpt_text_field(incharge),
+                seller_sp.gpt_text_field(title),
+            )
         time.sleep(float(CONFIG.get("WAIT_BETWEEN_BATCHES", 1)))
 
-    for idx, row in enumerate(rows, 1):
-        print(f"\n📍 [S4] row #{idx}")
+    for key, row in representatives.items():
         gpt_batch.append(row)
+        gpt_keys.append(key)
         if len(gpt_batch) >= batch_size:
-            flush_gpt_batch(gpt_batch)
+            flush_gpt_batch(gpt_batch, gpt_keys)
             gpt_batch = []
+            gpt_keys = []
 
     if gpt_batch:
-        flush_gpt_batch(gpt_batch)
+        flush_gpt_batch(gpt_batch, gpt_keys)
 
-    print(f"\n✅ STAGE 4 complete. Rows written: {written}")
+    mode = "w"
+    written = 0
+    cache_hits = 0
+    seen_keys: set = set()
+    buf: List[dict] = []
+
+    for idx, row in enumerate(rows, 1):
+        key = seller_dedup_key(row)
+        if key in seen_keys:
+            cache_hits += 1
+            print(f"\n📍 [S4] row #{idx} | ♻️  Reused cached GPT result ({key})")
+        else:
+            seen_keys.add(key)
+            print(f"\n📍 [S4] row #{idx} | GPT source for {key}")
+
+        email, phone, incharge, title = seller_gpt_cache[key]
+        out = {h: row.get(h, "null") for h in base_out_headers}
+        out["seller email"] = email
+        out["seller number"] = phone
+        out["seller incharge person"] = incharge
+        out["seller person title"] = title
+        buf.append(out)
+
+        if len(buf) >= batch_size:
+            flush_rows(CONFIG["STAGE4_OUTPUT_CSV"], headers, buf, mode)
+            written += len(buf)
+            print(f"   ✍️  Flushed {len(buf)} rows (total written: {written})")
+            buf = []
+            mode = "a"
+
+    if buf:
+        flush_rows(CONFIG["STAGE4_OUTPUT_CSV"], headers, buf, mode)
+        written += len(buf)
+        print(f"   ✍️  Final flush {len(buf)} rows (total written: {written})")
+
+    print(
+        f"\n✅ STAGE 4 complete. Rows written: {written} | "
+        f"Unique sellers (GPT calls): {len(representatives)} | Cache hits: {cache_hits}"
+    )
 
 
 def stage5():
@@ -757,8 +810,7 @@ def stage5():
 
         domain = seller_sp.extract_company_domain_from_email(row.get("seller email") or "")
         stage4_person = (row.get("seller incharge person") or "").strip()
-        seller_id = scraped_seller_id_cache_key(row)
-        seller_key = f"id:{seller_id}" if seller_id else f"name:{normalize_name_key(clean_name or raw_name)}"
+        seller_key = seller_dedup_key(row)
 
         print(f"\n📍 [S5] row #{idx} | seller: {clean_name or raw_name or 'N/A'} | domain: {domain or 'none'}")
 
