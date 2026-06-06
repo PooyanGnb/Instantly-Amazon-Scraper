@@ -45,6 +45,8 @@ def override_from_env(config, env_prefix=""):
                    "STAGE1_WRITE_BATCH_SIZE", "STAGE2_WRITE_BATCH_SIZE", "STAGE3_BATCH_SIZE",
                    "STAGE3_WRITE_BATCH_SIZE", "STAGE4_BATCH_SIZE", "STAGE5_WRITE_BATCH_SIZE",
                    "WRITE_BATCH_SIZE",
+                   "STAGE2_WORKERS", "STAGE3_WORKERS", "STAGE4_WORKERS", "STAGE5_WORKERS",
+                   "API_HTTP_RETRIES", "GPT_HTTP_RETRIES", "APOLLO_RATE_LIMIT_PER_MIN",
                    "APOLLO_API_TIMEOUT", "APOLLO_HTTP_RETRIES", "SEARCH_MAX_RESULTS"):
             # Var is present and set to none/null/empty → set config to None (e.g. no start line limit)
             if val.lower() in ("none", "null", ""):

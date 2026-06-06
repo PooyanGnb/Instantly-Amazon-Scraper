@@ -8,18 +8,19 @@ Stage 1:
 
 Stage 2:
 - Product endpoint per ASIN; append Scraped Seller Name/ID/URL
-- Cache by input seller name
+- One scrape API call per input seller name; 10 parallel workers
 
 Stage 3:
 - Seller profile per Scraped Seller ID; region filter DE/CH/AT only
-- Append seller region, postal code, rating, review count, description, about
-- Cache by Scraped Seller ID; wiped = region failures only
+- One profile API call per Scraped Seller ID; 10 parallel workers
 
 Stage 4:
 - GPT extract contacts from seller about + description (one GPT call per unique seller)
+- 10 parallel workers; 429 retry with backoff
 
 Stage 5:
 - Apollo domain search; match Stage 4 person + GPT outreach pick
+- One Apollo+GPT chain per unique seller; 4 parallel workers; Apollo rate limit 180/min
 """
 
 import argparse
@@ -29,9 +30,10 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import amazon_seller_pipeline as seller_sp
 from dotenv import load_dotenv
@@ -69,9 +71,16 @@ CONFIG = {
     "STAGE3_WRITE_BATCH_SIZE": 100,
     "STAGE4_BATCH_SIZE": 10,
     "STAGE5_WRITE_BATCH_SIZE": 50,
+    "STAGE2_WORKERS": 10,
+    "STAGE3_WORKERS": 10,
+    "STAGE4_WORKERS": 10,
+    "STAGE5_WORKERS": 4,
+    "API_HTTP_RETRIES": 5,
+    "GPT_HTTP_RETRIES": 5,
     "APOLLO_BASE_URL": "https://api.apollo.io/api/v1",
     "APOLLO_API_TIMEOUT": 60,
     "APOLLO_HTTP_RETRIES": 3,
+    "APOLLO_RATE_LIMIT_PER_MIN": 180,
     "APOLLO_SEARCH_BY_NAME_FALLBACK": False,
     "MODEL": "gpt-5-mini",
     "REASONING_EFFORT": "medium",
@@ -332,6 +341,8 @@ def sync_seller_module():
         "APOLLO_BASE_URL",
         "APOLLO_API_TIMEOUT",
         "APOLLO_HTTP_RETRIES",
+        "APOLLO_RATE_LIMIT_PER_MIN",
+        "API_HTTP_RETRIES",
         "APOLLO_SEARCH_BY_NAME_FALLBACK",
     )
     for k in shared_keys:
@@ -370,6 +381,61 @@ def seller_dedup_key(row: dict) -> str:
     if not clean_name and raw_name and raw_name.lower() != "null":
         clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
     return f"name:{normalize_name_key(clean_name or raw_name)}"
+
+
+def stage_work_key(stage: int, row: dict) -> str:
+    if stage == 2:
+        return seller_name_cache_key(row) or "__no_seller_name__"
+    if stage == 3:
+        return scraped_seller_id_cache_key(row) or "__no_seller_id__"
+    return seller_dedup_key(row)
+
+
+def build_seller_work_groups(
+    rows: List[dict], key_fn: Callable[[dict], str]
+) -> Tuple[Dict[str, dict], List[str]]:
+    representatives: Dict[str, dict] = {}
+    row_keys: List[str] = []
+    for row in rows:
+        key = key_fn(row)
+        row_keys.append(key)
+        if key not in representatives:
+            representatives[key] = row
+    return representatives, row_keys
+
+
+def run_seller_worker_pool(
+    work_items: List[Tuple[str, dict]],
+    process_fn: Callable[[str, dict], Any],
+    max_workers: int,
+    label: str,
+) -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    workers = max(1, int(max_workers))
+    print(f"   Parallel {label}: {len(work_items)} unique sellers, {workers} workers")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_key = {
+            executor.submit(process_fn, key, row): key for key, row in work_items
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+                print(f"   ✓ Completed seller {key}")
+            except Exception as e:
+                print(f"      ❌ Worker error for {key}: {e}")
+                results[key] = None
+    return results
+
+
+def _partition_work_chunks(
+    work_items: List[Tuple[str, dict]], num_workers: int
+) -> List[List[Tuple[str, dict]]]:
+    workers = max(1, int(num_workers))
+    chunks: List[List[Tuple[str, dict]]] = [[] for _ in range(workers)]
+    for i, item in enumerate(work_items):
+        chunks[i % workers].append(item)
+    return [chunk for chunk in chunks if chunk]
 
 
 def normalize_person_name(name: str) -> str:
@@ -427,6 +493,17 @@ def find_apollo_person_match(stage4_person: str, people: List[dict]) -> Optional
     return best
 
 
+def _is_gpt_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if "429" in msg or "rate limit" in msg or "rate_limit" in msg:
+        return True
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) == 429
+
+
 def call_gpt_stage4_extract(batch: List[dict]) -> str:
     lines = [
         "Extract from seller about + seller description only (see system rules).",
@@ -441,20 +518,31 @@ def call_gpt_stage4_extract(batch: List[dict]) -> str:
     lines.append("Answer only as CSV:")
     lines.append("Nr;seller email;seller number;seller incharge person;seller person title")
     user_prompt = "\n".join(lines)
-    try:
-        response = client.responses.create(
-            model=CONFIG["MODEL"],
-            reasoning={"effort": CONFIG["REASONING_EFFORT"]},
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT_STAGE4},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_output_tokens=int(CONFIG["MAX_OUTPUT_TOKENS"]),
-        )
-        return (response.output_text or "").strip()
-    except Exception as e:
-        print(f"      ❌ GPT error: {e}")
-        return ""
+    max_retries = int(CONFIG.get("GPT_HTTP_RETRIES", 5))
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.responses.create(
+                model=CONFIG["MODEL"],
+                reasoning={"effort": CONFIG["REASONING_EFFORT"]},
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT_STAGE4},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_output_tokens=int(CONFIG["MAX_OUTPUT_TOKENS"]),
+            )
+            return (response.output_text or "").strip()
+        except Exception as e:
+            last_err = e
+            if _is_gpt_rate_limit_error(e) and attempt < max_retries:
+                wait = min(2 ** attempt, 30)
+                print(f"      ⚠️  GPT rate limit; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            print(f"      ❌ GPT error: {e}")
+            return ""
+    print(f"      ❌ GPT error after retries: {last_err}")
+    return ""
 
 
 def call_gpt_stage4_with_retry(batch: List[dict], max_retries: int = 3):
@@ -471,6 +559,156 @@ def call_gpt_stage4_with_retry(batch: List[dict], max_retries: int = 3):
         time.sleep(float(CONFIG.get("WAIT_BETWEEN_BATCHES", 1)))
     print("      ❌ GPT batch still incomplete after retries; filling missing rows with null.")
     return last_rows
+
+
+def _fetch_stage2_seller_scrape(_key: str, rep_row: dict) -> Tuple[str, str, str]:
+    asin = (rep_row.get(ASIN_COL) or "").strip()
+    seller_name = seller_id = seller_link = "null"
+    if asin and asin.lower() != "null":
+        data = seller_sp.fetch_json_with_retry(seller_sp.build_product_url(asin))
+        product = (data or {}).get("product_results", {})
+        buybox = product.get("buybox", {}) if isinstance(product, dict) else {}
+        fulfillment = buybox.get("fulfillment", {}) if isinstance(buybox, dict) else {}
+        tps = fulfillment.get("third_party_seller", {}) if isinstance(fulfillment, dict) else {}
+        if isinstance(tps, dict) and (tps.get("id") or tps.get("name") or tps.get("link")):
+            seller_id = seller_sp.null_str(tps.get("id"))
+            seller_name = seller_sp.null_str(tps.get("name"))
+            seller_link = seller_sp.null_str(tps.get("link"))
+        else:
+            seller_name = seller_sp.null_str(product.get("sold_by"))
+    return seller_name, seller_id, seller_link
+
+
+def _null_stage3_profile() -> dict:
+    return {
+        "seller region": "null",
+        "seller postal code": "null",
+        "seller rating": "null",
+        "seller review count": "null",
+        "seller description": "null",
+        "seller about": "null",
+    }
+
+
+def _fetch_stage3_seller_profile(_key: str, rep_row: dict) -> dict:
+    seller_id = scraped_seller_id_raw(rep_row)
+    if not seller_id:
+        return _null_stage3_profile()
+
+    region = postal = rating = review_count = description = about = "null"
+    data = seller_sp.fetch_json_with_retry(seller_sp.build_seller_url(seller_id))
+    details = (data or {}).get("seller_profile", {}).get("seller_details", {})
+    if isinstance(details, dict):
+        addr_rows = details.get("business_address_rows")
+        if isinstance(addr_rows, list) and addr_rows:
+            region = seller_sp.null_str(addr_rows[-1]).upper()
+            postal = extract_postal_code(addr_rows)
+        rating = seller_sp.null_str(details.get("rating"))
+        review_count = seller_sp.null_str(details.get("ratings_total"))
+        description = seller_sp.seller_text_field(details.get("detailed_information"))
+        about = seller_sp.seller_text_field(details.get("about_this_seller"))
+    return {
+        "seller region": region,
+        "seller postal code": postal,
+        "seller rating": rating,
+        "seller review count": review_count,
+        "seller description": description,
+        "seller about": about,
+    }
+
+
+def _stage4_worker_process(chunk: List[Tuple[str, dict]]) -> Dict[str, Tuple[str, str, str, str]]:
+    cache: Dict[str, Tuple[str, str, str, str]] = {}
+    batch_size = int(CONFIG["STAGE4_BATCH_SIZE"])
+    gpt_batch: List[dict] = []
+    gpt_keys: List[str] = []
+
+    def flush_batch(items: List[dict], keys: List[str]):
+        if not items:
+            return
+        print(f"      🤖 GPT batch: {len(items)} sellers")
+        parsed = call_gpt_stage4_with_retry(items)
+        for i, key in enumerate(keys):
+            email, phone, incharge, title = parsed[i]
+            cache[key] = (
+                seller_sp.gpt_text_field(email),
+                seller_sp.phone_for_sheet(phone),
+                seller_sp.gpt_text_field(incharge),
+                seller_sp.gpt_text_field(title),
+            )
+        time.sleep(float(CONFIG.get("WAIT_BETWEEN_BATCHES", 1)))
+
+    for key, row in chunk:
+        gpt_batch.append(row)
+        gpt_keys.append(key)
+        if len(gpt_batch) >= batch_size:
+            flush_batch(gpt_batch, gpt_keys)
+            gpt_batch = []
+            gpt_keys = []
+    if gpt_batch:
+        flush_batch(gpt_batch, gpt_keys)
+    return cache
+
+
+def _process_stage5_seller(_key: str, rep_row: dict) -> Tuple[str, str, str, str, str]:
+    raw_name = (rep_row.get("Scraped Seller Name") or rep_row.get("Seller") or "").strip()
+    clean_name = seller_sp.extract_clean_company_name(raw_name)
+    if not clean_name and raw_name and raw_name.lower() != "null":
+        clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
+
+    domain = seller_sp.extract_company_domain_from_email(rep_row.get("seller email") or "")
+    stage4_person = (rep_row.get("seller incharge person") or "").strip()
+    matched_email = matched_title = outreach_name = outreach_title = outreach_email = "null"
+
+    if not domain:
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+
+    org = seller_sp.apollo_search_company(domain, clean_name or raw_name)
+    if not org or not isinstance(org, dict) or not org.get("id"):
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+
+    org_id = org.get("id")
+    people = seller_sp.apollo_list_people(org_id)
+    if not people:
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+
+    matched = find_apollo_person_match(stage4_person, people)
+    if matched and matched.get("id"):
+        person = seller_sp.apollo_match_person(matched["id"])
+        if person and isinstance(person, dict):
+            matched_email = seller_sp.gpt_text_field(person.get("email"))
+            matched_title = seller_sp.gpt_text_field(person.get("title"))
+
+    people_lines = []
+    for p in people:
+        if not isinstance(p, dict):
+            continue
+        pid = (p.get("id") or "").strip()
+        tit = (p.get("title") or "").strip()
+        if pid and tit:
+            people_lines.append((pid, tit))
+
+    if not people_lines:
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+
+    gpt_raw = seller_sp.call_gpt_stage5_rank_people(clean_name or raw_name or "", people_lines)
+    picks = seller_sp.parse_stage5_gpt_people(gpt_raw)
+    if not picks:
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+
+    ordered_ids = [p[0] for p in picks]
+    verified = seller_sp.pick_verified_apollo_contact(ordered_ids)
+    if not verified:
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+
+    outreach_name, outreach_title, outreach_email = verified
+    return (
+        matched_email,
+        matched_title,
+        seller_sp.gpt_text_field(outreach_name),
+        seller_sp.gpt_text_field(outreach_title),
+        seller_sp.gpt_text_field(outreach_email),
+    )
 
 
 def extract_postal_code(rows: list) -> str:
@@ -525,6 +763,7 @@ def stage2():
     print("=" * 90)
     print(f"📁 Input:  {CONFIG['STAGE1_SELLERS_OUTPUT_CSV']}")
     print(f"📁 Output: {CONFIG['STAGE2_OUTPUT_CSV']}")
+    print(f"👷 Workers: {CONFIG['STAGE2_WORKERS']}")
 
     sync_seller_module()
     with open(CONFIG["STAGE1_SELLERS_OUTPUT_CSV"], "r", encoding="utf-8") as f:
@@ -533,38 +772,33 @@ def stage2():
         rows = list(reader)
 
     headers = build_headers(base_headers, STAGE2_EXTRA)
-    scrape_cache: Dict[str, Tuple[str, str, str]] = {}
+    key_fn = lambda row: stage_work_key(2, row)
+    representatives, row_keys = build_seller_work_groups(rows, key_fn)
+    work_items = list(representatives.items())
+    scrape_cache = run_seller_worker_pool(
+        work_items,
+        _fetch_stage2_seller_scrape,
+        CONFIG["STAGE2_WORKERS"],
+        "stage 2 scrape",
+    )
+    null_scrape = ("null", "null", "null")
+    for key in representatives:
+        if scrape_cache.get(key) is None:
+            scrape_cache[key] = null_scrape
+
     buf = []
     written = 0
     mode = "w"
     batch_size = int(CONFIG["STAGE2_WRITE_BATCH_SIZE"])
+    cache_hits = 0
+    seen_keys: set = set()
 
-    for idx, row in enumerate(rows, 1):
-        asin = (row.get(ASIN_COL) or "").strip()
-        cache_key = seller_name_cache_key(row)
-        print(f"\n📍 [S2] row #{idx} | asin: {asin or 'null'} | seller: {cache_key or 'N/A'}")
-
-        if cache_key and cache_key in scrape_cache:
-            seller_name, seller_id, seller_link = scrape_cache[cache_key]
-            print("   ♻️  Reused cached scrape for seller name")
+    for idx, (row, key) in enumerate(zip(rows, row_keys), 1):
+        if key in seen_keys:
+            cache_hits += 1
         else:
-            seller_name = seller_id = seller_link = "null"
-            if asin and asin.lower() != "null":
-                data = seller_sp.fetch_json(seller_sp.build_product_url(asin))
-                product = (data or {}).get("product_results", {})
-                buybox = product.get("buybox", {}) if isinstance(product, dict) else {}
-                fulfillment = buybox.get("fulfillment", {}) if isinstance(buybox, dict) else {}
-                tps = fulfillment.get("third_party_seller", {}) if isinstance(fulfillment, dict) else {}
-                if isinstance(tps, dict) and (tps.get("id") or tps.get("name") or tps.get("link")):
-                    seller_id = seller_sp.null_str(tps.get("id"))
-                    seller_name = seller_sp.null_str(tps.get("name"))
-                    seller_link = seller_sp.null_str(tps.get("link"))
-                else:
-                    seller_name = seller_sp.null_str(product.get("sold_by"))
-                time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
-            if cache_key:
-                scrape_cache[cache_key] = (seller_name, seller_id, seller_link)
-
+            seen_keys.add(key)
+        seller_name, seller_id, seller_link = scrape_cache.get(key, null_scrape)
         out = dict(row)
         out["Scraped Seller Name"] = seller_name
         out["Scraped Seller ID"] = seller_id
@@ -583,7 +817,10 @@ def stage2():
         written += len(buf)
         print(f"   ✍️  Final flush {len(buf)} rows (total written: {written})")
 
-    print(f"\n✅ STAGE 2 complete. Rows written: {written} | Cache hits: {len(rows) - len(scrape_cache)}")
+    print(
+        f"\n✅ STAGE 2 complete. Rows written: {written} | "
+        f"Unique sellers: {len(representatives)} | Cache hits: {cache_hits}"
+    )
 
 
 def stage3():
@@ -593,6 +830,7 @@ def stage3():
     print(f"📁 Input:        {CONFIG['STAGE2_OUTPUT_CSV']}")
     print(f"📁 Main output:  {CONFIG['STAGE3_OUTPUT_CSV']}")
     print(f"📁 Wiped output: {CONFIG['STAGE3_WIPED_OUTPUT_CSV']}")
+    print(f"👷 Workers: {CONFIG['STAGE3_WORKERS']}")
 
     sync_seller_module()
     with open(CONFIG["STAGE2_OUTPUT_CSV"], "r", encoding="utf-8") as f:
@@ -601,60 +839,31 @@ def stage3():
         rows = list(reader)
 
     headers = build_headers(base_headers, STAGE3_EXTRA)
-    profile_cache: Dict[str, dict] = {}
+    key_fn = lambda row: stage_work_key(3, row)
+    representatives, row_keys = build_seller_work_groups(rows, key_fn)
+    work_items = list(representatives.items())
+    profile_cache = run_seller_worker_pool(
+        work_items,
+        _fetch_stage3_seller_profile,
+        CONFIG["STAGE3_WORKERS"],
+        "stage 3 profile",
+    )
+    null_profile = _null_stage3_profile()
+    for key in representatives:
+        if profile_cache.get(key) is None:
+            profile_cache[key] = null_profile
+
     region_kept = []
     region_wiped = []
+    cache_hits = 0
+    seen_keys: set = set()
 
-    for idx, row in enumerate(rows, 1):
-        seller_id = scraped_seller_id_raw(row)
-        cache_key = scraped_seller_id_cache_key(row)
-        print(f"\n📍 [S3] row #{idx} | scraped seller id: {seller_id or 'null'}")
-
-        if cache_key and cache_key in profile_cache:
-            profile = profile_cache[cache_key]
-            print("   ♻️  Reused cached seller profile")
+    for row, key in zip(rows, row_keys):
+        if key in seen_keys:
+            cache_hits += 1
         else:
-            region = postal = rating = review_count = description = about = "null"
-            addr_rows = None
-            if seller_id:
-                data = seller_sp.fetch_json(seller_sp.build_seller_url(seller_id))
-                details = (data or {}).get("seller_profile", {}).get("seller_details", {})
-                if isinstance(details, dict):
-                    addr_rows = details.get("business_address_rows")
-                    if isinstance(addr_rows, list) and addr_rows:
-                        region = seller_sp.null_str(addr_rows[-1]).upper()
-                        postal = extract_postal_code(addr_rows)
-                    rating = seller_sp.null_str(details.get("rating"))
-                    review_count = seller_sp.null_str(details.get("ratings_total"))
-                    description = seller_sp.seller_text_field(details.get("detailed_information"))
-                    about = seller_sp.seller_text_field(details.get("about_this_seller"))
-                if idx <= 3 or (seller_id.startswith("A2YL") and idx <= 20):
-                    _debug_log(
-                        "stage3:api_response",
-                        "seller profile fetch",
-                        {
-                            "row": idx,
-                            "seller_id": seller_id,
-                            "seller_id_lower": seller_id.lower(),
-                            "addr_rows_len": len(addr_rows) if isinstance(addr_rows, list) else None,
-                            "region": region,
-                            "postal": postal,
-                            "about_len": len(about) if about and about != "null" else 0,
-                        },
-                        hypothesis_id="H1",
-                    )
-                time.sleep(float(CONFIG["WAIT_BETWEEN_REQUESTS"]))
-            profile = {
-                "seller region": region,
-                "seller postal code": postal,
-                "seller rating": rating,
-                "seller review count": review_count,
-                "seller description": description,
-                "seller about": about,
-            }
-            if cache_key:
-                profile_cache[cache_key] = profile
-
+            seen_keys.add(key)
+        profile = profile_cache.get(key, null_profile)
         out = dict(row)
         out.update(profile)
         region_value = (out.get("seller region") or "").strip().upper()
@@ -680,7 +889,10 @@ def stage3():
                 wiped_n += len(chunk)
             mode = "a"
 
-    print(f"\n✅ STAGE 3 complete. Main: {kept_n} | Wiped: {wiped_n}")
+    print(
+        f"\n✅ STAGE 3 complete. Main: {kept_n} | Wiped: {wiped_n} | "
+        f"Unique sellers: {len(representatives)} | Cache hits: {cache_hits}"
+    )
 
 
 def stage4():
@@ -690,6 +902,7 @@ def stage4():
     print(f"📁 Input:  {CONFIG['STAGE3_OUTPUT_CSV']}")
     print(f"📁 Output: {CONFIG['STAGE4_OUTPUT_CSV']}")
     print(f"🤖 Model:  {CONFIG['MODEL']}")
+    print(f"👷 Workers: {CONFIG['STAGE4_WORKERS']}")
 
     with open(CONFIG["STAGE3_OUTPUT_CSV"], "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -700,58 +913,38 @@ def stage4():
     base_out_headers = [h for h in base_headers if h not in drop_cols]
     headers = build_headers(base_out_headers, STAGE4_EXTRA)
 
-    representatives: Dict[str, dict] = {}
-    for row in rows:
-        key = seller_dedup_key(row)
-        if key not in representatives:
-            representatives[key] = row
-
+    key_fn = lambda row: stage_work_key(4, row)
+    representatives, row_keys = build_seller_work_groups(rows, key_fn)
+    work_items = list(representatives.items())
+    chunks = _partition_work_chunks(work_items, CONFIG["STAGE4_WORKERS"])
     seller_gpt_cache: Dict[str, Tuple[str, str, str, str]] = {}
-    gpt_batch: List[dict] = []
-    gpt_keys: List[str] = []
-    batch_size = int(CONFIG["STAGE4_BATCH_SIZE"])
+    null_gpt = ("null", "null", "null", "null")
 
-    def flush_gpt_batch(items: List[dict], keys: List[str]):
-        if not items:
-            return
-        print(f"\n   🤖 Calling GPT for {len(items)} unique sellers...")
-        parsed = call_gpt_stage4_with_retry(items)
-        for i, key in enumerate(keys):
-            email, phone, incharge, title = parsed[i]
-            seller_gpt_cache[key] = (
-                seller_sp.gpt_text_field(email),
-                seller_sp.phone_for_sheet(phone),
-                seller_sp.gpt_text_field(incharge),
-                seller_sp.gpt_text_field(title),
-            )
-        time.sleep(float(CONFIG.get("WAIT_BETWEEN_BATCHES", 1)))
+    print(f"   Parallel stage 4 GPT: {len(work_items)} unique sellers, {len(chunks)} worker chunks")
+    with ThreadPoolExecutor(max_workers=max(1, int(CONFIG["STAGE4_WORKERS"]))) as executor:
+        futures = [executor.submit(_stage4_worker_process, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            try:
+                seller_gpt_cache.update(future.result())
+            except Exception as e:
+                print(f"      ❌ Stage 4 worker chunk error: {e}")
 
-    for key, row in representatives.items():
-        gpt_batch.append(row)
-        gpt_keys.append(key)
-        if len(gpt_batch) >= batch_size:
-            flush_gpt_batch(gpt_batch, gpt_keys)
-            gpt_batch = []
-            gpt_keys = []
-
-    if gpt_batch:
-        flush_gpt_batch(gpt_batch, gpt_keys)
+    for key in representatives:
+        if key not in seller_gpt_cache:
+            seller_gpt_cache[key] = null_gpt
 
     mode = "w"
     written = 0
     cache_hits = 0
     seen_keys: set = set()
     buf: List[dict] = []
+    batch_size = int(CONFIG["STAGE4_BATCH_SIZE"])
 
-    for idx, row in enumerate(rows, 1):
-        key = seller_dedup_key(row)
+    for row, key in zip(rows, row_keys):
         if key in seen_keys:
             cache_hits += 1
-            print(f"\n📍 [S4] row #{idx} | ♻️  Reused cached GPT result ({key})")
         else:
             seen_keys.add(key)
-            print(f"\n📍 [S4] row #{idx} | GPT source for {key}")
-
         email, phone, incharge, title = seller_gpt_cache[key]
         out = {h: row.get(h, "null") for h in base_out_headers}
         out["seller email"] = email
@@ -774,7 +967,7 @@ def stage4():
 
     print(
         f"\n✅ STAGE 4 complete. Rows written: {written} | "
-        f"Unique sellers (GPT calls): {len(representatives)} | Cache hits: {cache_hits}"
+        f"Unique sellers: {len(representatives)} | Cache hits: {cache_hits}"
     )
 
 
@@ -785,6 +978,7 @@ def stage5():
     print(f"📁 Input:  {CONFIG['STAGE4_OUTPUT_CSV']}")
     print(f"📁 Output: {CONFIG['STAGE5_OUTPUT_CSV']}")
     print(f"🤖 Model:  {CONFIG['MODEL']}")
+    print(f"👷 Workers: {CONFIG['STAGE5_WORKERS']}")
 
     sync_seller_module()
 
@@ -794,97 +988,40 @@ def stage5():
         rows = list(reader)
 
     headers = build_headers(base_headers, STAGE5_EXTRA)
-    seller_cache: Dict[str, Tuple[str, str, str, str, str]] = {}
+    key_fn = lambda row: stage_work_key(5, row)
+    representatives, row_keys = build_seller_work_groups(rows, key_fn)
+    work_items = list(representatives.items())
+    seller_cache = run_seller_worker_pool(
+        work_items,
+        _process_stage5_seller,
+        CONFIG["STAGE5_WORKERS"],
+        "stage 5 Apollo+GPT",
+    )
+    null_stage5 = ("null", "null", "null", "null", "null")
+    skipped = 0
+    for key in representatives:
+        result = seller_cache.get(key)
+        if result is None:
+            seller_cache[key] = null_stage5
+            skipped += 1
+        elif result == null_stage5:
+            skipped += 1
+
     buf = []
     written = 0
-    skipped = 0
     cache_hits = 0
+    seen_keys: set = set()
     mode = "w"
     batch_size = int(CONFIG["STAGE5_WRITE_BATCH_SIZE"])
 
-    for idx, row in enumerate(rows, 1):
-        raw_name = (row.get("Scraped Seller Name") or row.get("Seller") or "").strip()
-        clean_name = seller_sp.extract_clean_company_name(raw_name)
-        if not clean_name and raw_name and raw_name.lower() != "null":
-            clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
-
-        domain = seller_sp.extract_company_domain_from_email(row.get("seller email") or "")
-        stage4_person = (row.get("seller incharge person") or "").strip()
-        seller_key = seller_dedup_key(row)
-
-        print(f"\n📍 [S5] row #{idx} | seller: {clean_name or raw_name or 'N/A'} | domain: {domain or 'none'}")
-
-        if seller_key in seller_cache:
-            matched_email, matched_title, outreach_name, outreach_title, outreach_email = seller_cache[seller_key]
+    for row, seller_key in zip(rows, row_keys):
+        if seller_key in seen_keys:
             cache_hits += 1
-            print("   ♻️  Reused cached seller result")
         else:
-            matched_email = matched_title = outreach_name = outreach_title = outreach_email = "null"
-
-            if not domain:
-                print("   ⏭️  Skip: no usable company domain (name-search disabled)")
-                skipped += 1
-            else:
-                org = seller_sp.apollo_search_company(domain, clean_name or raw_name)
-                time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
-                if not org or not isinstance(org, dict) or not org.get("id"):
-                    print("   ⏭️  Skip: no Apollo organization")
-                    skipped += 1
-                else:
-                    org_id = org.get("id")
-                    people = seller_sp.apollo_list_people(org_id)
-                    time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
-                    if not people:
-                        print("   ⏭️  Skip: no people on organization")
-                        skipped += 1
-                    else:
-                        matched = find_apollo_person_match(stage4_person, people)
-                        if matched and matched.get("id"):
-                            person = seller_sp.apollo_match_person(matched["id"])
-                            time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
-                            if person and isinstance(person, dict):
-                                matched_email = seller_sp.gpt_text_field(person.get("email"))
-                                matched_title = seller_sp.gpt_text_field(person.get("title"))
-                                print("   ✓ Matched Stage 4 person in Apollo list")
-
-                        people_lines = []
-                        for p in people:
-                            if not isinstance(p, dict):
-                                continue
-                            pid = (p.get("id") or "").strip()
-                            tit = (p.get("title") or "").strip()
-                            if pid and tit:
-                                people_lines.append((pid, tit))
-
-                        if not people_lines:
-                            print("   ⏭️  Skip: no id/title pairs for GPT pick")
-                            skipped += 1
-                        else:
-                            gpt_raw = seller_sp.call_gpt_stage5_rank_people(clean_name or raw_name or "", people_lines)
-                            picks = seller_sp.parse_stage5_gpt_people(gpt_raw)
-                            if not picks:
-                                print("   ⏭️  Skip: GPT found no suitable outreach contacts")
-                                skipped += 1
-                            else:
-                                ordered_ids = [p[0] for p in picks]
-                                verified = seller_sp.pick_verified_apollo_contact(ordered_ids)
-                                if not verified:
-                                    print("   ⏭️  Skip: no verified Apollo email on outreach picks")
-                                    skipped += 1
-                                else:
-                                    outreach_name, outreach_title, outreach_email = verified
-                                    outreach_name = seller_sp.gpt_text_field(outreach_name)
-                                    outreach_title = seller_sp.gpt_text_field(outreach_title)
-                                    outreach_email = seller_sp.gpt_text_field(outreach_email)
-
-            seller_cache[seller_key] = (
-                matched_email,
-                matched_title,
-                outreach_name,
-                outreach_title,
-                outreach_email,
-            )
-
+            seen_keys.add(seller_key)
+        matched_email, matched_title, outreach_name, outreach_title, outreach_email = seller_cache.get(
+            seller_key, null_stage5
+        )
         out = {h: row.get(h, "") for h in base_headers}
         out["matched_contact_apollo_email"] = matched_email
         out["matched_contact_apollo_title"] = matched_title
@@ -905,7 +1042,10 @@ def stage5():
         written += len(buf)
         print(f"   ✍️  Final flush {len(buf)} rows (total written: {written})")
 
-    print(f"\n✅ STAGE 5 complete. Rows written: {written} | Skipped: {skipped} | Cache hits: {cache_hits}")
+    print(
+        f"\n✅ STAGE 5 complete. Rows written: {written} | "
+        f"Unique sellers: {len(representatives)} | Skipped sellers: {skipped} | Cache hits: {cache_hits}"
+    )
 
 
 STAGES = {

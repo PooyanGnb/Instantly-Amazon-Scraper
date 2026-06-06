@@ -42,8 +42,9 @@ import csv
 import html
 import os
 import re
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import quote_plus
@@ -89,6 +90,8 @@ CONFIG = {
     "APOLLO_API_TIMEOUT": 60,
     "APOLLO_HTTP_RETRIES": 3,
     "APOLLO_SEARCH_BY_NAME_FALLBACK": False,
+    "APOLLO_RATE_LIMIT_PER_MIN": 180,
+    "API_HTTP_RETRIES": 5,
 
     # GPT settings
     "MODEL": "gpt-5-mini",
@@ -289,6 +292,37 @@ def extract_company_domain_from_email(seller_email: str):
     return dom or None
 
 
+_apollo_rate_lock = threading.Lock()
+_apollo_rate_timestamps: deque = deque()
+
+
+def _apollo_acquire_rate_slot():
+    limit = int(CONFIG.get("APOLLO_RATE_LIMIT_PER_MIN", 180))
+    window = 60.0
+    with _apollo_rate_lock:
+        now = time.time()
+        while _apollo_rate_timestamps and now - _apollo_rate_timestamps[0] >= window:
+            _apollo_rate_timestamps.popleft()
+        if len(_apollo_rate_timestamps) >= limit:
+            sleep_for = window - (now - _apollo_rate_timestamps[0]) + 0.05
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            now = time.time()
+            while _apollo_rate_timestamps and now - _apollo_rate_timestamps[0] >= window:
+                _apollo_rate_timestamps.popleft()
+        _apollo_rate_timestamps.append(time.time())
+
+
+def _retry_after_seconds(response, attempt: int) -> float:
+    retry_after = (response.headers.get("Retry-After") or "").strip()
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.5)
+        except ValueError:
+            pass
+    return min(2 ** attempt, 30)
+
+
 def apollo_post(path, json_body=None, params=None):
     url = (CONFIG.get("APOLLO_BASE_URL") or "https://api.apollo.io/api/v1").rstrip("/") + path
     headers = {
@@ -296,8 +330,10 @@ def apollo_post(path, json_body=None, params=None):
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
     }
+    max_retries = int(CONFIG.get("APOLLO_HTTP_RETRIES", 3))
     last_err = None
-    for attempt in range(1, int(CONFIG.get("APOLLO_HTTP_RETRIES", 3)) + 1):
+    for attempt in range(1, max_retries + 1):
+        _apollo_acquire_rate_slot()
         try:
             r = requests.post(
                 url,
@@ -306,12 +342,27 @@ def apollo_post(path, json_body=None, params=None):
                 params=params,
                 timeout=int(CONFIG.get("APOLLO_API_TIMEOUT", 60)),
             )
+            if r.status_code == 429:
+                wait = _retry_after_seconds(r, attempt)
+                print(f"      ⚠️  Apollo 429 rate limit; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             return r.json()
+        except requests.HTTPError as e:
+            last_err = e
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 429:
+                wait = _retry_after_seconds(resp, attempt)
+                print(f"      ⚠️  Apollo 429 rate limit; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            print(f"      ⚠️  Apollo HTTP attempt {attempt}/{max_retries}: {e}")
+            time.sleep(min(2 ** attempt, 30))
         except Exception as e:
             last_err = e
-            print(f"      ⚠️  Apollo HTTP attempt {attempt}/{CONFIG.get('APOLLO_HTTP_RETRIES', 3)}: {e}")
-            time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
+            print(f"      ⚠️  Apollo HTTP attempt {attempt}/{max_retries}: {e}")
+            time.sleep(min(2 ** attempt, 30))
     print(f"      ❌ Apollo failed after retries: {last_err}")
     return None
 
@@ -562,13 +613,48 @@ def parse_recent_sales(v):
 
 
 def fetch_json(url):
-    try:
-        r = requests.get(url, timeout=int(CONFIG["API_TIMEOUT"]))
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"    ❌ API error: {e}")
-        return None
+    return fetch_json_with_retry(url)
+
+
+def fetch_json_with_retry(url):
+    max_retries = int(CONFIG.get("API_HTTP_RETRIES", 5))
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, timeout=int(CONFIG["API_TIMEOUT"]))
+            if r.status_code == 429:
+                wait = _retry_after_seconds(r, attempt)
+                print(f"    ⚠️  Scrape API 429; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            if r.status_code == 503:
+                wait = min(2 ** attempt, 30)
+                print(f"    ⚠️  Scrape API 503; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = e
+            wait = min(2 ** attempt, 30)
+            print(f"    ⚠️  Scrape API timeout/connection; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+            time.sleep(wait)
+        except requests.HTTPError as e:
+            last_err = e
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code in (429, 503):
+                wait = _retry_after_seconds(resp, attempt) if resp.status_code == 429 else min(2 ** attempt, 30)
+                time.sleep(wait)
+                continue
+            print(f"    ❌ API error: {e}")
+            return None
+        except Exception as e:
+            last_err = e
+            wait = min(2 ** attempt, 30)
+            print(f"    ⚠️  Scrape API error; waiting {wait:.1f}s (attempt {attempt}/{max_retries}): {e}")
+            time.sleep(wait)
+    print(f"    ❌ API error after retries: {last_err}")
+    return None
 
 
 def flush_rows(path, headers, rows, mode):

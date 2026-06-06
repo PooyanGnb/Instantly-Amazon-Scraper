@@ -72,10 +72,10 @@ Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **ph
 
 - **Purpose:** Classify product rows as Amazon sellers vs resellers, then enrich **sellers only** through scrape, GPT, and Apollo.
 - **Stage 1:** Read input CSV; map columns via `IMPORT_COLUMN_*` in `.env`. Classify: Amazon retail → reseller; brand–seller name match (fuzzy) → seller; otherwise → reseller. Seller count is ignored. Output `import_sellers.csv` + `import_resellers.csv` (sorted by seller name A→Z). Appends `asin`.
-- **Stage 2:** Product API per ASIN; append `Scraped Seller Name`, `Scraped Seller ID`, `Scraped Seller URL`. Cache by input seller name.
-- **Stage 3:** Seller profile per `Scraped Seller ID`; region filter **DE/CH/AT** only; append region, postal code, rating, reviews, description, about. Wiped = region failures only (no product cap).
-- **Stage 4:** GPT extracts `seller email`, `seller number`, `seller incharge person`, `seller person title` from about + description. One GPT call per unique seller (by Scraped Seller ID, else seller name); duplicate product rows reuse the same result. When multiple emails/phones exist, prefer a pair from the same section (about or description).
-- **Stage 5:** Apollo domain search (no name fallback); match Stage 4 person in org people list + GPT outreach pick. Appends `matched_contact_apollo_*` and `outreach_apollo_*` columns.
+- **Stage 2:** Product API per ASIN; append `Scraped Seller Name`, `Scraped Seller ID`, `Scraped Seller URL`. One scrape per input seller name; **10 parallel workers** (`IMPORT_STAGE2_WORKERS`). Group key: seller name. Scrape API 429 retry with backoff.
+- **Stage 3:** Seller profile per `Scraped Seller ID`; region filter **DE/CH/AT** only; append region, postal code, rating, reviews, description, about. Wiped = region failures only. One profile call per seller ID; **10 parallel workers** (`IMPORT_STAGE3_WORKERS`). Group key: Scraped Seller ID.
+- **Stage 4:** GPT extracts contact fields from about + description. One GPT call per unique seller (Scraped Seller ID, else seller name); **10 parallel workers** (`IMPORT_STAGE4_WORKERS`); GPT 429 retry. Prefer email/phone from the same section when multiple contacts exist.
+- **Stage 5:** Apollo domain search (no name fallback); match Stage 4 person + GPT outreach pick. One Apollo+GPT chain per unique seller; **4 parallel workers** (`IMPORT_STAGE5_WORKERS`); Apollo sliding-window limit **180 req/min** (`IMPORT_APOLLO_RATE_LIMIT_PER_MIN`) with 429 retry.
 - **Needs:** `.env` with `API_KEY`, `OPENAI_API_KEY`, `APOLLO_API_KEY`, and `IMPORT_*` overrides.
 - **Run:** `python amazon_import_products_pipeline.py` or `python amazon_import_products_pipeline.py --stage 3`
 
