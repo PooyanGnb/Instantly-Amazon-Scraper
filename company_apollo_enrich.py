@@ -12,25 +12,31 @@ Set APOLLOCOMPANY_COLUMN_EMAIL empty (or omit) to disable email fallback entirel
 
 Flow (same as amazon_seller_pipeline Stage 5):
   resolve domain → Apollo org → list people → GPT rank up to 3 → first verified email match.
+
+Parallel: one Apollo+GPT chain per unique company (domain or name); 4 workers by default.
 """
 
 import csv
 import html
 import os
 import re
+import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+
 from dotenv import load_dotenv
 from openai import OpenAI
 
 from config_env import override_from_env
 
 CONFIG = {
-    "INPUT_CSV": "data/company_leads.csv",
+    "INPUT_CSV": "data/companiesApollo.csv",
     "OUTPUT_CSV": "data/company_leads_apollo.csv",
     "COLUMN_COMPANY_NAME": ["Company Name", "company name", "Seller Name"],
     "COLUMN_WEBSITE": ["Website", "website"],
@@ -40,6 +46,8 @@ CONFIG = {
     "APOLLO_BASE_URL": "https://api.apollo.io/api/v1",
     "APOLLO_API_TIMEOUT": 60,
     "APOLLO_HTTP_RETRIES": 3,
+    "APOLLO_RATE_LIMIT_PER_MIN": 180,
+    "WORKERS": 4,
     "APOLLO_SEARCH_BY_NAME_FALLBACK": False,
     "SKIP_EXISTING": True,
     "REVEAL_PHONE_NUMBER": False,
@@ -312,6 +320,37 @@ def null_str(v) -> str:
     return str(v)
 
 
+_apollo_rate_lock = threading.Lock()
+_apollo_rate_timestamps: deque = deque()
+
+
+def _apollo_acquire_rate_slot():
+    limit = int(CONFIG.get("APOLLO_RATE_LIMIT_PER_MIN", 180))
+    window = 60.0
+    with _apollo_rate_lock:
+        now = time.time()
+        while _apollo_rate_timestamps and now - _apollo_rate_timestamps[0] >= window:
+            _apollo_rate_timestamps.popleft()
+        if len(_apollo_rate_timestamps) >= limit:
+            sleep_for = window - (now - _apollo_rate_timestamps[0]) + 0.05
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            now = time.time()
+            while _apollo_rate_timestamps and now - _apollo_rate_timestamps[0] >= window:
+                _apollo_rate_timestamps.popleft()
+        _apollo_rate_timestamps.append(time.time())
+
+
+def _retry_after_seconds(response, attempt: int) -> float:
+    retry_after = (response.headers.get("Retry-After") or "").strip()
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.5)
+        except ValueError:
+            pass
+    return min(2 ** attempt, 30)
+
+
 def apollo_post(path, json_body=None, params=None):
     url = (CONFIG.get("APOLLO_BASE_URL") or "https://api.apollo.io/api/v1").rstrip("/") + path
     headers = {
@@ -319,9 +358,10 @@ def apollo_post(path, json_body=None, params=None):
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
     }
+    max_retries = int(CONFIG.get("APOLLO_HTTP_RETRIES", 3))
     last_err = None
-    retries = int(CONFIG.get("APOLLO_HTTP_RETRIES", 3))
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, max_retries + 1):
+        _apollo_acquire_rate_slot()
         try:
             r = requests.post(
                 url,
@@ -330,13 +370,28 @@ def apollo_post(path, json_body=None, params=None):
                 params=params,
                 timeout=int(CONFIG.get("APOLLO_API_TIMEOUT", 60)),
             )
+            if r.status_code == 429:
+                wait = _retry_after_seconds(r, attempt)
+                print(f"      ⚠️  Apollo 429 rate limit; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             return r.json()
+        except requests.HTTPError as e:
+            last_err = e
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 429:
+                wait = _retry_after_seconds(resp, attempt)
+                print(f"      ⚠️  Apollo 429 rate limit; waiting {wait:.1f}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            print(f"      ⚠️  Apollo HTTP attempt {attempt}/{max_retries}: {e}")
+            time.sleep(min(2 ** attempt, 30))
         except Exception as e:
             last_err = e
-            print(f"      Apollo HTTP attempt {attempt}/{retries}: {e}")
-            time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
-    print(f"      Apollo failed after retries: {last_err}")
+            print(f"      ⚠️  Apollo HTTP attempt {attempt}/{max_retries}: {e}")
+            time.sleep(min(2 ** attempt, 30))
+    print(f"      ❌ Apollo failed after retries: {last_err}")
     return None
 
 
@@ -540,6 +595,56 @@ def load_done_row_keys(path: Path) -> set:
     return done
 
 
+def build_row_context(row: Dict[str, str]) -> Dict[str, Any]:
+    raw_name = pick_column(row, CONFIG["COLUMN_COMPANY_NAME"])
+    website = pick_column(row, CONFIG["COLUMN_WEBSITE"])
+    email = pick_column(row, CONFIG["COLUMN_EMAIL"]) if email_column_enabled() else ""
+    clean_name = extract_clean_company_name(raw_name)
+    if not clean_name and raw_name and raw_name.lower() != "null":
+        clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
+    domain, domain_src = resolve_company_domain(website, email)
+    ctx_name = clean_name or raw_name or "unknown"
+    return {
+        "raw_name": raw_name,
+        "domain": domain,
+        "domain_src": domain_src,
+        "ctx_name": ctx_name,
+        "key": cache_key(domain, ctx_name),
+    }
+
+
+def _process_company_work(key: str, ctx: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    domain = ctx.get("domain")
+    ctx_name = ctx.get("ctx_name") or "unknown"
+    print(
+        f"\n   [company {key}] name={ctx_name} | domain={domain or 'none'} | source={ctx.get('domain_src')}"
+    )
+    return enrich_company(domain, ctx_name)
+
+
+def run_company_worker_pool(
+    work_items: List[Tuple[str, Dict[str, Any]]],
+    max_workers: int,
+) -> Dict[str, Tuple[str, str, str, str, str]]:
+    results: Dict[str, Tuple[str, str, str, str, str]] = {}
+    workers = max(1, int(max_workers))
+    null5 = ("null", "null", "null", "null", "null")
+    print(f"   Parallel enrich: {len(work_items)} unique companies, {workers} workers")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_key = {
+            executor.submit(_process_company_work, key, ctx): key for key, ctx in work_items
+        }
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+                print(f"   ✓ Completed company {key}")
+            except Exception as e:
+                print(f"      ❌ Worker error for {key}: {e}")
+                results[key] = null5
+    return results
+
+
 def flush_rows(path: str, headers: List[str], rows: List[Dict[str, str]], mode: str):
     if not rows:
         return
@@ -603,68 +708,79 @@ def run():
     else:
         print("Phone reveal: disabled")
     print(f"Skip existing: {skip_existing} ({len(done_row_keys)} rows already done)")
-
-    company_cache: Dict[str, Tuple[str, str, str, str, str]] = {}
-    mode = "a" if out_path.is_file() and skip_existing else "w"
-    buf: List[Dict[str, str]] = []
-    written = 0
-    skipped_resume = 0
-    cache_hits = 0
-    batch_size = int(CONFIG.get("WRITE_BATCH_SIZE", 50))
+    print(f"Workers: {CONFIG.get('WORKERS', 4)}")
 
     with open(in_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         input_headers = list(reader.fieldnames or [])
-        out_headers = input_headers + [h for h in OUTPUT_EXTRA_HEADERS if h not in input_headers]
+        all_rows = list(reader)
 
-        for idx, row in enumerate(reader, 1):
-            if skip_existing and row_identity_key(row) in done_row_keys:
-                skipped_resume += 1
-                print(f"\n[row {idx}] skipped (already in output)")
-                continue
+    out_headers = input_headers + [h for h in OUTPUT_EXTRA_HEADERS if h not in input_headers]
 
-            raw_name = pick_column(row, CONFIG["COLUMN_COMPANY_NAME"])
-            website = pick_column(row, CONFIG["COLUMN_WEBSITE"])
-            email = pick_column(row, CONFIG["COLUMN_EMAIL"]) if email_column_enabled() else ""
-            clean_name = extract_clean_company_name(raw_name)
-            if not clean_name and raw_name and raw_name.lower() != "null":
-                clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
+    pending: List[Tuple[int, Dict[str, str], Dict[str, Any]]] = []
+    skipped_resume = 0
+    for idx, row in enumerate(all_rows, 1):
+        if skip_existing and row_identity_key(row) in done_row_keys:
+            skipped_resume += 1
+            print(f"\n[row {idx}] skipped (already in output)")
+            continue
+        pending.append((idx, row, build_row_context(row)))
 
-            domain, domain_src = resolve_company_domain(website, email)
-            ctx_name = clean_name or raw_name or "unknown"
+    company_reps: Dict[str, Dict[str, Any]] = {}
+    row_keys: List[str] = []
+    for _idx, _row, ctx in pending:
+        key = ctx["key"]
+        row_keys.append(key)
+        if key not in company_reps:
+            company_reps[key] = ctx
 
-            print(f"\n[row {idx}] company={ctx_name} | domain={domain or 'none'} | source={domain_src}")
+    company_cache = run_company_worker_pool(
+        list(company_reps.items()),
+        CONFIG.get("WORKERS", 4),
+    )
+    null5 = ("null", "null", "null", "null", "null")
+    for key in company_reps:
+        if key not in company_cache:
+            company_cache[key] = null5
 
-            key = cache_key(domain, ctx_name)
-            if key in company_cache:
-                pname, ptitle, pemail, pphone, pid = company_cache[key]
-                cache_hits += 1
-                print("   Reused cached company result")
-            else:
-                pname, ptitle, pemail, pphone, pid = enrich_company(domain, ctx_name)
-                company_cache[key] = (pname, ptitle, pemail, pphone, pid)
+    mode = "a" if out_path.is_file() and skip_existing else "w"
+    buf: List[Dict[str, str]] = []
+    written = 0
+    cache_hits = 0
+    seen_company_keys: set = set()
+    batch_size = int(CONFIG.get("WRITE_BATCH_SIZE", 50))
 
-            out = dict(row)
-            out["person name"] = pname
-            out["person title"] = ptitle
-            out["person email"] = pemail
-            out["person phone"] = pphone
-            out["person id"] = pid
-            buf.append(out)
+    for (idx, row, _ctx), key in zip(pending, row_keys):
+        pname, ptitle, pemail, pphone, pid = company_cache.get(key, null5)
+        if key in seen_company_keys:
+            cache_hits += 1
+        else:
+            seen_company_keys.add(key)
+        print(f"\n[row {idx}] applying result for {key}")
+        out = dict(row)
+        out["person name"] = pname
+        out["person title"] = ptitle
+        out["person email"] = pemail
+        out["person phone"] = pphone
+        out["person id"] = pid
+        buf.append(out)
 
-            if len(buf) >= batch_size:
-                flush_rows(str(out_path), out_headers, buf, mode)
-                written += len(buf)
-                print(f"   Flushed {len(buf)} rows (total: {written})")
-                buf = []
-                mode = "a"
+        if len(buf) >= batch_size:
+            flush_rows(str(out_path), out_headers, buf, mode)
+            written += len(buf)
+            print(f"   Flushed {len(buf)} rows (total: {written})")
+            buf = []
+            mode = "a"
 
     if buf:
         flush_rows(str(out_path), out_headers, buf, mode)
         written += len(buf)
         print(f"   Final flush {len(buf)} rows (total: {written})")
 
-    print(f"\nDone. Written: {written} | Resume skipped: {skipped_resume} | Cache hits: {cache_hits}")
+    print(
+        f"\nDone. Written: {written} | Resume skipped: {skipped_resume} | "
+        f"Unique companies: {len(company_reps)} | Cache hits: {cache_hits}"
+    )
 
 
 if __name__ == "__main__":
