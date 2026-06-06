@@ -646,6 +646,14 @@ def fetch_json_with_retry(url):
                 wait = _retry_after_seconds(resp, attempt) if resp.status_code == 429 else min(2 ** attempt, 30)
                 time.sleep(wait)
                 continue
+            if resp is not None and resp.status_code == 400:
+                try:
+                    body = resp.json()
+                    err_msg = body.get("error") or body.get("message") or resp.text[:200]
+                    print(f"    ⚠️  Scrape API 400: {err_msg}")
+                    return body
+                except Exception:
+                    pass
             print(f"    ❌ API error: {e}")
             return None
         except Exception as e:

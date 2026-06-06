@@ -9,6 +9,7 @@ Stage 1:
 Stage 2:
 - Product endpoint per ASIN; append Scraped Seller Name/ID/URL
 - One scrape API call per input seller name; 10 parallel workers
+- On empty/incomplete product page (API failure), try next ASIN for that seller
 
 Stage 3:
 - Seller profile per Scraped Seller ID; region filter DE/CH/AT only
@@ -26,9 +27,9 @@ Stage 5:
 import argparse
 import csv
 import html
-import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
@@ -128,28 +129,6 @@ _AMAZON_RETAIL_PATTERNS = (
 API_KEY = ""
 APOLLO_API_KEY = ""
 client = None
-
-DEBUG_LOG_PATH = Path(__file__).resolve().parent / ".cursor" / "debug-09ef33.log"
-
-
-def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = "", run_id: str = "pre-fix"):
-    # #region agent log
-    try:
-        payload = {
-            "sessionId": "09ef33",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
 SYSTEM_PROMPT_STAGE4 = """Extract structured fields from the provided seller texts only.
 
@@ -298,6 +277,71 @@ def flush_rows(path: str, headers: List[str], rows: List[dict], mode: str):
         w.writerows(rows)
 
 
+def write_csv_header_only(path: str, headers: List[str]):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=headers, extrasaction="ignore").writeheader()
+
+
+_scrape_request_progress: Optional[Any] = None
+
+
+class RequestProgress:
+    """Thread-safe counter for parallel scrape API requests."""
+
+    def __init__(self, total: int, label: str = "request"):
+        self.total = max(0, int(total))
+        self.done = 0
+        self._lock = threading.Lock()
+        self.label = label
+
+    def begin(self) -> str:
+        with self._lock:
+            self.done += 1
+            current = self.done
+        remaining = max(0, self.total - current)
+        return f"[{current}/{self.total} {self.label}, {remaining} remaining]"
+
+
+def _set_scrape_request_progress(progress: Optional[RequestProgress]) -> None:
+    global _scrape_request_progress
+    _scrape_request_progress = progress
+
+
+def _log_scrape_request(detail: str) -> None:
+    progress = _scrape_request_progress
+    if progress is not None:
+        print(f"   {progress.begin()} {detail}")
+    else:
+        print(f"   {detail}")
+
+
+def _scrape_fetch_json(url: str):
+    fn = getattr(seller_sp, "fetch_json_with_retry", None)
+    if callable(fn):
+        return fn(url)
+    return seller_sp.fetch_json(url)
+
+
+def _is_scrape_api_failure(data: Optional[dict]) -> bool:
+    """True when the scrape failed and another seller ASIN should be tried."""
+    if not data or not isinstance(data, dict):
+        return True
+    if data.get("status") == "Failure":
+        return True
+    status_code = data.get("status_code")
+    if status_code is not None:
+        try:
+            if int(status_code) >= 400:
+                return True
+        except (TypeError, ValueError):
+            pass
+    err = str(data.get("error") or data.get("message") or "").lower()
+    if err and ("empty" in err or "incomplete" in err):
+        return True
+    return False
+
+
 def read_input_rows(path: str) -> Tuple[List[str], List[dict]]:
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -402,6 +446,29 @@ def build_seller_work_groups(
         if key not in representatives:
             representatives[key] = row
     return representatives, row_keys
+
+
+def build_seller_row_groups(
+    rows: List[dict], key_fn: Callable[[dict], str]
+) -> Tuple[Dict[str, List[dict]], List[str]]:
+    groups: Dict[str, List[dict]] = {}
+    row_keys: List[str] = []
+    for row in rows:
+        key = key_fn(row)
+        row_keys.append(key)
+        groups.setdefault(key, []).append(row)
+    return groups, row_keys
+
+
+def _collect_row_asins(rows: List[dict]) -> List[str]:
+    seen: set = set()
+    asins: List[str] = []
+    for row in rows:
+        asin = (row.get(ASIN_COL) or "").strip().upper()
+        if asin and asin.lower() != "null" and asin not in seen:
+            seen.add(asin)
+            asins.append(asin)
+    return asins
 
 
 def run_seller_worker_pool(
@@ -561,22 +628,79 @@ def call_gpt_stage4_with_retry(batch: List[dict], max_retries: int = 3):
     return last_rows
 
 
-def _fetch_stage2_seller_scrape(_key: str, rep_row: dict) -> Tuple[str, str, str]:
-    asin = (rep_row.get(ASIN_COL) or "").strip()
+def polish_phone_for_sheet(v: str) -> str:
+    """Normalize phone to +{country}{number} digits; prefix with ' for CSV/sheets."""
+    s = (v or "").strip()
+    if s.startswith("'"):
+        s = s[1:].strip()
+    if not s or s.lower() in ("null", "none", "n/a", "na", "-"):
+        return "null"
+
+    international = s.startswith("+") or s.startswith("00")
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return "null"
+
+    if digits.startswith("00"):
+        digits = digits[2:]
+        international = True
+
+    if international or digits.startswith("49"):
+        if digits.startswith("49"):
+            rest = digits[2:]
+            if rest.startswith("0"):
+                rest = rest[1:]
+            digits = "49" + rest
+        elif digits.startswith("0") and len(digits) > 1:
+            digits = "49" + digits[1:]
+        num = "+" + digits
+    else:
+        num = "+" + digits if s.startswith("+") else digits
+
+    return "'" + num
+
+
+def _extract_product_seller_fields(data: dict) -> Tuple[str, str, str]:
     seller_name = seller_id = seller_link = "null"
-    if asin and asin.lower() != "null":
-        data = seller_sp.fetch_json_with_retry(seller_sp.build_product_url(asin))
-        product = (data or {}).get("product_results", {})
-        buybox = product.get("buybox", {}) if isinstance(product, dict) else {}
-        fulfillment = buybox.get("fulfillment", {}) if isinstance(buybox, dict) else {}
-        tps = fulfillment.get("third_party_seller", {}) if isinstance(fulfillment, dict) else {}
-        if isinstance(tps, dict) and (tps.get("id") or tps.get("name") or tps.get("link")):
-            seller_id = seller_sp.null_str(tps.get("id"))
-            seller_name = seller_sp.null_str(tps.get("name"))
-            seller_link = seller_sp.null_str(tps.get("link"))
-        else:
-            seller_name = seller_sp.null_str(product.get("sold_by"))
+    product = data.get("product_results", {})
+    buybox = product.get("buybox", {}) if isinstance(product, dict) else {}
+    fulfillment = buybox.get("fulfillment", {}) if isinstance(buybox, dict) else {}
+    tps = fulfillment.get("third_party_seller", {}) if isinstance(fulfillment, dict) else {}
+    if isinstance(tps, dict) and (tps.get("id") or tps.get("name") or tps.get("link")):
+        seller_id = seller_sp.null_str(tps.get("id"))
+        seller_name = seller_sp.null_str(tps.get("name"))
+        seller_link = seller_sp.null_str(tps.get("link"))
+    else:
+        seller_name = seller_sp.null_str(product.get("sold_by"))
     return seller_name, seller_id, seller_link
+
+
+def _scrape_product_asin(asin: str) -> Tuple[str, str, str, bool]:
+    """Returns seller fields and api_failed (True => try next ASIN for this seller)."""
+    data = _scrape_fetch_json(seller_sp.build_product_url(asin))
+    if _is_scrape_api_failure(data):
+        return "null", "null", "null", True
+    return (*_extract_product_seller_fields(data), False)
+
+
+def _fetch_stage2_seller_scrape_group(key: str, group_rows: List[dict]) -> Tuple[str, str, str]:
+    asins = _collect_row_asins(group_rows)
+    best = ("null", "null", "null")
+    for idx, asin in enumerate(asins):
+        _log_scrape_request(f"Product scrape ASIN {asin} (seller: {key})")
+        seller_name, seller_id, seller_link, api_failed = _scrape_product_asin(asin)
+        if api_failed:
+            remaining = len(asins) - idx - 1
+            if remaining:
+                print(f"    ⚠️  ASIN {asin} failed; trying next product ({remaining} left for seller).")
+            else:
+                print(f"    ⚠️  ASIN {asin} failed; no more products for this seller.")
+            continue
+        if seller_id != "null":
+            return seller_name, seller_id, seller_link
+        if seller_name != "null" and best[0] == "null":
+            best = (seller_name, seller_id, seller_link)
+    return best
 
 
 def _null_stage3_profile() -> dict:
@@ -596,7 +720,8 @@ def _fetch_stage3_seller_profile(_key: str, rep_row: dict) -> dict:
         return _null_stage3_profile()
 
     region = postal = rating = review_count = description = about = "null"
-    data = seller_sp.fetch_json_with_retry(seller_sp.build_seller_url(seller_id))
+    _log_scrape_request(f"Seller profile scrape ID {seller_id} (seller: {_key})")
+    data = _scrape_fetch_json(seller_sp.build_seller_url(seller_id))
     details = (data or {}).get("seller_profile", {}).get("seller_details", {})
     if isinstance(details, dict):
         addr_rows = details.get("business_address_rows")
@@ -632,7 +757,7 @@ def _stage4_worker_process(chunk: List[Tuple[str, dict]]) -> Dict[str, Tuple[str
             email, phone, incharge, title = parsed[i]
             cache[key] = (
                 seller_sp.gpt_text_field(email),
-                seller_sp.phone_for_sheet(phone),
+                polish_phone_for_sheet(phone),
                 seller_sp.gpt_text_field(incharge),
                 seller_sp.gpt_text_field(title),
             )
@@ -773,16 +898,22 @@ def stage2():
 
     headers = build_headers(base_headers, STAGE2_EXTRA)
     key_fn = lambda row: stage_work_key(2, row)
-    representatives, row_keys = build_seller_work_groups(rows, key_fn)
-    work_items = list(representatives.items())
-    scrape_cache = run_seller_worker_pool(
-        work_items,
-        _fetch_stage2_seller_scrape,
-        CONFIG["STAGE2_WORKERS"],
-        "stage 2 scrape",
-    )
+    seller_groups, row_keys = build_seller_row_groups(rows, key_fn)
+    work_items = list(seller_groups.items())
+    max_product_requests = sum(len(_collect_row_asins(group_rows)) for group_rows in seller_groups.values())
+    print(f"   Max product scrape requests: {max_product_requests} (may stop early per seller on success)")
+    _set_scrape_request_progress(RequestProgress(max_product_requests, "product scrapes"))
+    try:
+        scrape_cache = run_seller_worker_pool(
+            work_items,
+            _fetch_stage2_seller_scrape_group,
+            CONFIG["STAGE2_WORKERS"],
+            "stage 2 scrape",
+        )
+    finally:
+        _set_scrape_request_progress(None)
     null_scrape = ("null", "null", "null")
-    for key in representatives:
+    for key in seller_groups:
         if scrape_cache.get(key) is None:
             scrape_cache[key] = null_scrape
 
@@ -819,7 +950,7 @@ def stage2():
 
     print(
         f"\n✅ STAGE 2 complete. Rows written: {written} | "
-        f"Unique sellers: {len(representatives)} | Cache hits: {cache_hits}"
+        f"Unique sellers: {len(seller_groups)} | Cache hits: {cache_hits}"
     )
 
 
@@ -842,12 +973,18 @@ def stage3():
     key_fn = lambda row: stage_work_key(3, row)
     representatives, row_keys = build_seller_work_groups(rows, key_fn)
     work_items = list(representatives.items())
-    profile_cache = run_seller_worker_pool(
-        work_items,
-        _fetch_stage3_seller_profile,
-        CONFIG["STAGE3_WORKERS"],
-        "stage 3 profile",
-    )
+    max_profile_requests = sum(1 for _, row in work_items if scraped_seller_id_raw(row))
+    print(f"   Max profile scrape requests: {max_profile_requests}")
+    _set_scrape_request_progress(RequestProgress(max_profile_requests, "profile scrapes"))
+    try:
+        profile_cache = run_seller_worker_pool(
+            work_items,
+            _fetch_stage3_seller_profile,
+            CONFIG["STAGE3_WORKERS"],
+            "stage 3 profile",
+        )
+    finally:
+        _set_scrape_request_progress(None)
     null_profile = _null_stage3_profile()
     for key in representatives:
         if profile_cache.get(key) is None:
@@ -880,6 +1017,8 @@ def stage3():
         (CONFIG["STAGE3_WIPED_OUTPUT_CSV"], region_wiped, "wiped"),
     ):
         mode = "w"
+        if not data:
+            write_csv_header_only(path, headers)
         for i in range(0, len(data), batch_size):
             chunk = data[i : i + batch_size]
             flush_rows(path, headers, chunk, mode)
@@ -904,10 +1043,28 @@ def stage4():
     print(f"🤖 Model:  {CONFIG['MODEL']}")
     print(f"👷 Workers: {CONFIG['STAGE4_WORKERS']}")
 
+    stage3_path = Path(CONFIG["STAGE3_OUTPUT_CSV"])
+    if not stage3_path.exists():
+        print(f"   ⚠️  Stage 3 main output missing: {stage3_path}")
+        print("   ⏭️  Stage 4 skipped — re-run stage 3 after stage 2 succeeds.")
+        return
+
     with open(CONFIG["STAGE3_OUTPUT_CSV"], "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         base_headers = list(reader.fieldnames or [])
         rows = list(reader)
+
+    if not rows:
+        print("   ⚠️  Stage 3 main output is empty — no rows to process.")
+        write_csv_header_only(
+            CONFIG["STAGE4_OUTPUT_CSV"],
+            build_headers(
+                [h for h in base_headers if h not in {"seller description", "seller about"}],
+                STAGE4_EXTRA,
+            ),
+        )
+        print(f"\n✅ STAGE 4 complete. Rows written: 0")
+        return
 
     drop_cols = {"seller description", "seller about"}
     base_out_headers = [h for h in base_headers if h not in drop_cols]
