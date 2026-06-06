@@ -77,6 +77,9 @@ def override_from_env(config, env_prefix=""):
             "COLUMN_COMPANY_NAME",
             "COLUMN_WEBSITE",
             "COLUMN_EMAIL",
+            "COLUMN_ASIN_OR_URL",
+            "COLUMN_SELLER_COUNT",
+            "COLUMN_BRAND_NAME",
         ):
             config[key] = [c.strip() for c in val.split(",") if c.strip()]
         else:

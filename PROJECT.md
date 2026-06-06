@@ -16,6 +16,7 @@ Run the scripts in this order. Each step uses the output of the previous one (or
 | **Alt flow** | **amazon_resellers_pipeline.py** | CSV with `Amazon Link` | Final reseller CSV (`Product1 Link`, `Product2 Link`, `Product1 Name`, `Product2 Name`) |
 | **Alt flow** | **amazon_seller_niche_pipeline.py** | CSV/XLSX with `Seller ID` + `Seller Link` + lead columns | CSV/XLSX with niche rank + text contact + Apollo contact columns |
 | **Alt flow** | **company_apollo_enrich.py** | CSV with `Company Name` + `Website` or email | Same columns + `person name`, `person title`, `person email`, `person phone`, `person id` |
+| **Alt flow** | **amazon_import_products_pipeline.py** | CSV like `ImportProducts.csv` (ASIN/URL, Seller, Brand, seller count) | Stage 5: sellers enriched + Apollo contacts (`import_stage5.csv`); resellers split in Stage 1 |
 
 **One-line summary:**  
 Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **phone_clean.py** (clean phones) → ready for use (e.g. email campaigns).
@@ -67,6 +68,17 @@ Leads → **main.py** (scrape products) → **gpt.py** (Variable 1 & 2) → **ph
 
 ---
 
+### 6. amazon_import_products_pipeline.py – ImportProducts classify + seller enrich (5 stages)
+
+- **Purpose:** Classify product rows as Amazon sellers vs resellers, then enrich **sellers only** through scrape, GPT, and Apollo.
+- **Stage 1:** Read input CSV; map columns via `IMPORT_COLUMN_*` in `.env`. Classify: Amazon retail → reseller; brand–seller name match (fuzzy) → seller; otherwise → reseller. Seller count is ignored. Output `import_sellers.csv` + `import_resellers.csv` (sorted by seller name A→Z). Appends `asin`.
+- **Stage 2:** Product API per ASIN; append `Scraped Seller Name`, `Scraped Seller ID`, `Scraped Seller URL`. Cache by input seller name.
+- **Stage 3:** Seller profile per `Scraped Seller ID`; region filter **DE/CH/AT** only; append region, postal code, rating, reviews, description, about. Wiped = region failures only (no product cap).
+- **Stage 4:** GPT extracts `seller email`, `seller number`, `seller incharge person`, `seller person title` from about + description.
+- **Stage 5:** Apollo domain search (no name fallback); match Stage 4 person in org people list + GPT outreach pick. Appends `matched_contact_apollo_*` and `outreach_apollo_*` columns.
+- **Needs:** `.env` with `API_KEY`, `OPENAI_API_KEY`, `APOLLO_API_KEY`, and `IMPORT_*` overrides.
+- **Run:** `python amazon_import_products_pipeline.py` or `python amazon_import_products_pipeline.py --stage 3`
+
 ### 5. amazon_resellers_pipeline.py – Reseller discovery + product-name cleanup (3 stages)
 
 - **Purpose:** End-to-end pipeline for reseller inputs where each row has an `Amazon Link` (URL or ASIN).
@@ -110,6 +122,17 @@ SELLERNICHE_MODEL=gpt-5-mini
 - **phone_clean.py** does not use `.env`.
 - **amazon_seller_niche_pipeline.py** uses `API_KEY`, `OPENAI_API_KEY`, and `SELLERNICHE_*` overrides; `APOLLO_API_KEY` is required only when `SELLERNICHE_RUN_STAGE2_PERSON_STAGE=true`.
 - **company_apollo_enrich.py** uses `OPENAI_API_KEY`, `APOLLO_API_KEY`, and `APOLLOCOMPANY_*` overrides (no Web Scraping API).
+- **amazon_import_products_pipeline.py** uses `API_KEY`, `OPENAI_API_KEY`, `APOLLO_API_KEY`, and `IMPORT_*` overrides.
+
+```env
+# amazon_import_products_pipeline.py (prefix IMPORT_)
+IMPORT_INPUT_CSV=data/ImportProducts.csv
+IMPORT_COLUMN_ASIN_OR_URL=ASIN,URL
+IMPORT_COLUMN_SELLER_COUNT=Number of Active Sellers
+IMPORT_COLUMN_SELLER_NAME=Seller
+IMPORT_COLUMN_BRAND_NAME=Brand
+IMPORT_STAGE5_OUTPUT_CSV=data/import_stage5.csv
+```
 
 ### CSV structure (flexible)
 
@@ -167,6 +190,15 @@ You can override all important settings with **environment variables** (no code 
 3. Run `python amazon_seller_niche_pipeline.py`.
 4. Stage 1 output: input columns + `niche rank` (streamed writes).
 5. Stage 2 output: input columns + `niche rank`, `text email`, `text number`, `text name`, `text title`, `apollo name`, `apollo title`, `apollo email` (streamed writes).
+
+### Alternative import products flow
+
+1. Put your CSV in `data/` (e.g. `ImportProducts.csv` with `URL`, `ASIN`, `Brand`, `Seller`, `Number of Active Sellers`).
+2. Set `IMPORT_*` keys in `.env` (column mapping + output paths).
+3. Run `python amazon_import_products_pipeline.py`.
+4. Use `IMPORT_STAGE5_OUTPUT_CSV` for enriched sellers; `IMPORT_STAGE1_RESELLERS_OUTPUT_CSV` for classified resellers.
+
+**Stage 1 rules:** Amazon retail → reseller; seller name matches brand (fuzzy, e.g. `KEMMLIT` ↔ `KEMMLIT Bauelemente GmbH`) → seller; otherwise → reseller. Seller count is not used.
 
 ### Alternative company Apollo flow
 
