@@ -168,6 +168,9 @@ APOLLOCOMPANY_OUTPUT_CSV=data/company_leads_apollo.csv
 # APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK=true
 # APOLLOCOMPANY_COLUMN_COMPANY_NAME=Company Name,company name
 # APOLLOCOMPANY_COLUMN_WEBSITE=Website,website
+# APOLLOCOMPANY_COLUMN_CITY=Sitz,City
+# APOLLOCOMPANY_COLUMN_STATE=Bundesland,State
+# APOLLOCOMPANY_COLUMN_COUNTRY=
 # APOLLOCOMPANY_COLUMN_EMAIL=Email,email
 # APOLLOCOMPANY_COLUMN_EMAIL=
 APOLLOCOMPANY_REVEAL_PHONE_NUMBER=false
@@ -179,12 +182,15 @@ APOLLOCOMPANY_WEBHOOK_URL=
 | `APOLLOCOMPANY_INPUT_CSV` | `data/company_leads.csv` | Input CSV |
 | `APOLLOCOMPANY_OUTPUT_CSV` | `data/company_leads_apollo.csv` | Output CSV |
 | `APOLLOCOMPANY_MODEL` | `gpt-5-mini` | OpenAI model |
-| `APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK` | `false` | Search Apollo by name when domain missing |
+| `APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK` | `false` | After domain miss (or no domain): name+location, then name-only if no location columns |
 | `APOLLOCOMPANY_SKIP_EXISTING` | `true` | Skip rows already enriched in output |
 | `APOLLOCOMPANY_WRITE_BATCH_SIZE` | `50` | Rows per CSV flush |
 | `APOLLOCOMPANY_COLUMN_COMPANY_NAME` | `Company Name,company name,...` | Header aliases |
 | `APOLLOCOMPANY_COLUMN_WEBSITE` | `Website,website` | Website header aliases |
 | `APOLLOCOMPANY_COLUMN_EMAIL` | *(empty = disabled)* | Email header aliases; empty env disables email fallback |
+| `APOLLOCOMPANY_COLUMN_CITY` | `Sitz,City,city` | City for Apollo `organization_locations` on name fallback |
+| `APOLLOCOMPANY_COLUMN_STATE` | `Bundesland,State,state` | State/region for Apollo `organization_locations` on name fallback |
+| `APOLLOCOMPANY_COLUMN_COUNTRY` | *(empty = disabled)* | Optional country column for `organization_locations` |
 | `APOLLOCOMPANY_REVEAL_PHONE_NUMBER` | `false` | Request Apollo phone reveal via webhook on `people/match` |
 | `APOLLOCOMPANY_WEBHOOK_URL` | *(empty)* | Required when reveal is true; Apollo POSTs phone data here later |
 

@@ -42,6 +42,7 @@ def override_from_env(config, env_prefix=""):
         val = val.strip()
         if key in ("START_FROM_LINE", "MAX_RECORDS", "WAIT_BETWEEN_REQUESTS", "API_TIMEOUT",
                    "BATCH_SIZE", "MAX_OUTPUT_TOKENS", "MAX_TOOL_CALLS", "WAIT_BETWEEN_BATCHES",
+                   "WORKERS",
                    "STAGE1_WRITE_BATCH_SIZE", "STAGE2_WRITE_BATCH_SIZE", "STAGE3_BATCH_SIZE",
                    "STAGE3_WRITE_BATCH_SIZE", "STAGE4_BATCH_SIZE", "STAGE5_WRITE_BATCH_SIZE",
                    "WRITE_BATCH_SIZE",
@@ -80,7 +81,11 @@ def override_from_env(config, env_prefix=""):
             "COLUMN_COMPANY_NAME",
             "COLUMN_WEBSITE",
             "COLUMN_EMAIL",
+            "COLUMN_CITY",
+            "COLUMN_STATE",
+            "COLUMN_COUNTRY",
             "COLUMN_ASIN_OR_URL",
+            "COLUMN_AMAZON_LINK",
             "COLUMN_SELLER_COUNT",
             "COLUMN_BRAND_NAME",
         ):

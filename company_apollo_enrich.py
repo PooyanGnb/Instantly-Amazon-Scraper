@@ -12,6 +12,7 @@ Set APOLLOCOMPANY_COLUMN_EMAIL empty (or omit) to disable email fallback entirel
 
 Flow (same as amazon_seller_pipeline Stage 5):
   resolve domain → Apollo org → list people → GPT rank up to 3 → first verified email match.
+  Org search tiers: domain → name+HQ location (city/state) → name-only (when fallback enabled).
 
 Parallel: one Apollo+GPT chain per unique company (domain or name); 4 workers by default.
 """
@@ -41,6 +42,9 @@ CONFIG = {
     "COLUMN_COMPANY_NAME": ["Company Name", "company name", "Seller Name"],
     "COLUMN_WEBSITE": ["Website", "website"],
     "COLUMN_EMAIL": [],
+    "COLUMN_CITY": ["Sitz", "City", "city"],
+    "COLUMN_STATE": ["Bundesland", "State", "state"],
+    "COLUMN_COUNTRY": [],
     "WRITE_BATCH_SIZE": 50,
     "WAIT_BETWEEN_REQUESTS": 1,
     "APOLLO_BASE_URL": "https://api.apollo.io/api/v1",
@@ -395,18 +399,8 @@ def apollo_post(path, json_body=None, params=None):
     return None
 
 
-def apollo_search_company(domain: Optional[str], company_name: str):
-    path = "/mixed_companies/search"
-    if domain:
-        data = apollo_post(path, json_body={"q_organization_domains_list": [domain]})
-    elif config_bool("APOLLO_SEARCH_BY_NAME_FALLBACK"):
-        qn = (company_name or "").strip()
-        if not qn:
-            return None
-        data = apollo_post(path, json_body={"q_organization_name": qn})
-    else:
-        return None
-    if not data:
+def _first_apollo_org(data: Optional[dict]) -> Optional[dict]:
+    if not data or not isinstance(data, dict):
         return None
     orgs = data.get("organizations") or []
     if orgs:
@@ -418,6 +412,87 @@ def apollo_search_company(domain: Optional[str], company_name: str):
         if oid:
             return {"id": oid, "_from_account": True}
     return None
+
+
+def build_organization_locations(city: str, state: str, country: str) -> List[str]:
+    """Build deduped Apollo organization_locations from row fields (city, state, country)."""
+    out: List[str] = []
+    seen: set = set()
+    for raw in (city, state, country):
+        v = (raw or "").strip()
+        if not v or v.lower() == "null":
+            continue
+        key = v.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+def _apollo_search_by_domain(domain: str) -> Optional[dict]:
+    path = "/mixed_companies/search"
+    data = apollo_post(path, json_body={"q_organization_domains_list": [domain]})
+    org = _first_apollo_org(data)
+    if org:
+        print(f"      Domain search: {domain} → found org {org.get('id', '')}")
+    else:
+        print(f"      Domain search: {domain} → 0 results")
+    return org
+
+
+def _apollo_search_by_name(company_name: str, locations: Optional[List[str]] = None) -> Optional[dict]:
+    path = "/mixed_companies/search"
+    qn = (company_name or "").strip()
+    if not qn:
+        return None
+    body: Dict[str, Any] = {"q_organization_name": qn, "per_page": 10}
+    locs = [x for x in (locations or []) if x and str(x).strip()]
+    if locs:
+        body["organization_locations"] = locs
+        print(f"      Name+location search: {qn} | locations={locs}")
+    else:
+        print(f"      Name-only search: {qn} (no location columns)")
+    data = apollo_post(path, json_body=body)
+    org = _first_apollo_org(data)
+    if org:
+        tier = "name+location" if locs else "name-only"
+        print(f"      {tier} search → found org {org.get('id', '')}")
+    else:
+        tier = "name+location" if locs else "name-only"
+        print(f"      {tier} search → 0 results")
+    return org
+
+
+def apollo_search_company(
+    domain: Optional[str],
+    company_name: str,
+    locations: Optional[List[str]] = None,
+) -> Optional[dict]:
+    name_fallback = config_bool("APOLLO_SEARCH_BY_NAME_FALLBACK")
+    qn = (company_name or "").strip()
+    locs = [x for x in (locations or []) if x and str(x).strip()]
+
+    if domain:
+        org = _apollo_search_by_domain(domain)
+        if org:
+            return org
+        if not name_fallback:
+            return None
+        if not qn:
+            return None
+        print("      Domain miss; trying name fallback")
+        if locs:
+            return _apollo_search_by_name(qn, locs)
+        return _apollo_search_by_name(qn, None)
+
+    if not name_fallback:
+        return None
+    if not qn:
+        return None
+    if locs:
+        return _apollo_search_by_name(qn, locs)
+    return _apollo_search_by_name(qn, None)
 
 
 def apollo_list_people(org_id: str):
@@ -523,7 +598,11 @@ def cache_key(domain: Optional[str], company_name: str) -> str:
     return f"name:{n}" if n else "name:unknown"
 
 
-def enrich_company(domain: Optional[str], company_name: str) -> Tuple[str, str, str, str, str]:
+def enrich_company(
+    domain: Optional[str],
+    company_name: str,
+    locations: Optional[List[str]] = None,
+) -> Tuple[str, str, str, str, str]:
     """Returns person name, title, email, phone, person id (null strings on failure)."""
     null5 = ("null", "null", "null", "null", "null")
     if not domain and not config_bool("APOLLO_SEARCH_BY_NAME_FALLBACK"):
@@ -533,7 +612,7 @@ def enrich_company(domain: Optional[str], company_name: str) -> Tuple[str, str, 
         print("   Skip: no domain and no company name")
         return null5
 
-    org = apollo_search_company(domain, company_name)
+    org = apollo_search_company(domain, company_name, locations)
     time.sleep(float(CONFIG.get("WAIT_BETWEEN_REQUESTS", 1)))
     if not org or not isinstance(org, dict) or not org.get("id"):
         print("   Skip: no Apollo organization")
@@ -599,16 +678,21 @@ def build_row_context(row: Dict[str, str]) -> Dict[str, Any]:
     raw_name = pick_column(row, CONFIG["COLUMN_COMPANY_NAME"])
     website = pick_column(row, CONFIG["COLUMN_WEBSITE"])
     email = pick_column(row, CONFIG["COLUMN_EMAIL"]) if email_column_enabled() else ""
+    city = pick_column(row, CONFIG["COLUMN_CITY"])
+    state = pick_column(row, CONFIG["COLUMN_STATE"])
+    country = pick_column(row, CONFIG["COLUMN_COUNTRY"])
     clean_name = extract_clean_company_name(raw_name)
     if not clean_name and raw_name and raw_name.lower() != "null":
         clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
     domain, domain_src = resolve_company_domain(website, email)
     ctx_name = clean_name or raw_name or "unknown"
+    locations = build_organization_locations(city, state, country)
     return {
         "raw_name": raw_name,
         "domain": domain,
         "domain_src": domain_src,
         "ctx_name": ctx_name,
+        "locations": locations,
         "key": cache_key(domain, ctx_name),
     }
 
@@ -616,10 +700,13 @@ def build_row_context(row: Dict[str, str]) -> Dict[str, Any]:
 def _process_company_work(key: str, ctx: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     domain = ctx.get("domain")
     ctx_name = ctx.get("ctx_name") or "unknown"
+    locations = ctx.get("locations") or []
+    loc_hint = f" | locations={locations}" if locations else ""
     print(
-        f"\n   [company {key}] name={ctx_name} | domain={domain or 'none'} | source={ctx.get('domain_src')}"
+        f"\n   [company {key}] name={ctx_name} | domain={domain or 'none'} | "
+        f"source={ctx.get('domain_src')}{loc_hint}"
     )
-    return enrich_company(domain, ctx_name)
+    return enrich_company(domain, ctx_name, locations)
 
 
 def run_company_worker_pool(
@@ -669,6 +756,13 @@ def run():
         "company name",
         "Seller Name",
     ]
+    CONFIG["COLUMN_CITY"] = normalize_column_aliases("COLUMN_CITY") or ["Sitz", "City", "city"]
+    CONFIG["COLUMN_STATE"] = normalize_column_aliases("COLUMN_STATE") or [
+        "Bundesland",
+        "State",
+        "state",
+    ]
+    CONFIG["COLUMN_COUNTRY"] = normalize_column_aliases("COLUMN_COUNTRY")
 
     if config_bool("REVEAL_PHONE_NUMBER"):
         webhook = (CONFIG.get("WEBHOOK_URL") or "").strip()

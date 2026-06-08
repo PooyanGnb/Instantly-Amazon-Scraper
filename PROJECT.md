@@ -209,10 +209,12 @@ Use **`company_apollo_enrich.py`** when you have a plain company list (no Amazon
 3. Run `python company_apollo_enrich.py`.
 4. Output adds: `person name`, `person title`, `person email`, `person phone`, `person id` (best of up to 3 GPT-ranked Apollo contacts with verified email; `null` when none).
 
-**Domain rules:** **Website** is used first when the row has a non-empty website value (`http`/`https`/`www` and paths stripped to a host like `link.com`). **Email** domain is used only when website is empty and `APOLLOCOMPANY_COLUMN_EMAIL` is set in `.env` (leave empty to disable email entirely). Public mail domains are rejected via `public_email_domains.txt`. Optional `APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK=true` when no domain is available.
+**Domain rules:** **Website** is used first when the row has a non-empty website value (`http`/`https`/`www` and paths stripped to a host like `link.com`). **Email** domain is used only when website is empty and `APOLLOCOMPANY_COLUMN_EMAIL` is set in `.env` (leave empty to disable email entirely). Public mail domains are rejected via `public_email_domains.txt`.
+
+**Apollo org search tiers** (when `APOLLOCOMPANY_APOLLO_SEARCH_BY_NAME_FALLBACK=true`): (1) domain from website/email, (2) company name + HQ location (`organization_locations` from city/state/country columns), (3) company name only when no location columns are set. Tier 2 runs after a domain miss, not only when domain is missing.
 
 **Phone reveal (optional):** `APOLLOCOMPANY_REVEAL_PHONE_NUMBER=true` requires `APOLLOCOMPANY_WEBHOOK_URL`. The script sends `reveal_phone_number` and `webhook_url` on `people/match`; `person phone` is written as `null` until Apollo posts the number to your webhook. Use `person id` (Apollo `id` from the match response) to correlate callback data with CSV rows. A webhook receiver that auto-updates the CSV is not included in this repo.
 
-**Column aliases** (first match wins): `APOLLOCOMPANY_COLUMN_COMPANY_NAME`, `APOLLOCOMPANY_COLUMN_WEBSITE`, `APOLLOCOMPANY_COLUMN_EMAIL` (comma-separated lists).
+**Column aliases** (first match wins): `APOLLOCOMPANY_COLUMN_COMPANY_NAME`, `APOLLOCOMPANY_COLUMN_WEBSITE`, `APOLLOCOMPANY_COLUMN_EMAIL`, `APOLLOCOMPANY_COLUMN_CITY`, `APOLLOCOMPANY_COLUMN_STATE`, `APOLLOCOMPANY_COLUMN_COUNTRY` (comma-separated lists). Example for German sheets: `COLUMN_CITY=Sitz`, `COLUMN_STATE=Bundesland`.
 
 **Resume:** `APOLLOCOMPANY_SKIP_EXISTING=true` (default) skips rows already in the output file with a non-null `person email` (matched by company + website + email); new rows are appended.
