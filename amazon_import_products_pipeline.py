@@ -20,7 +20,8 @@ Stage 4:
 - 10 parallel workers; 429 retry with backoff
 
 Stage 5:
-- Apollo domain search; match Stage 4 person + GPT outreach pick
+- Apollo org search: domain from seller email, then name+location fallback (city/state/country)
+  when IMPORT_APOLLO_SEARCH_BY_NAME_FALLBACK=true; match Stage 4 person + GPT outreach pick
 - One Apollo+GPT chain per unique seller; 4 parallel workers; Apollo rate limit 180/min
 """
 
@@ -48,6 +49,9 @@ CONFIG = {
     "COLUMN_SELLER_COUNT": ["Number of Active Sellers"],
     "COLUMN_SELLER_NAME": ["Seller"],
     "COLUMN_BRAND_NAME": ["Brand"],
+    "COLUMN_CITY": ["Sitz", "City", "city"],
+    "COLUMN_STATE": ["Bundesland", "State", "state"],
+    "COLUMN_COUNTRY": ["Seller Country/Region", "seller region"],
     "STAGE1_SELLERS_OUTPUT_CSV": "data/import_sellers.csv",
     "STAGE1_RESELLERS_OUTPUT_CSV": "data/import_resellers.csv",
     "STAGE2_OUTPUT_CSV": "data/import_stage2.csv",
@@ -775,6 +779,43 @@ def _stage4_worker_process(chunk: List[Tuple[str, dict]]) -> Dict[str, Tuple[str
     return cache
 
 
+def build_organization_locations(city: str, state: str, country: str) -> List[str]:
+    """Build deduped Apollo organization_locations from row fields (city, state, country)."""
+    out: List[str] = []
+    seen: set = set()
+    for raw in (city, state, country):
+        v = (raw or "").strip()
+        if not v or v.lower() == "null":
+            continue
+        key = v.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+def _build_stage5_locations(row: dict) -> List[str]:
+    city = pick_column(row, _column_aliases("COLUMN_CITY"))
+    state = pick_column(row, _column_aliases("COLUMN_STATE"))
+    country = pick_column(row, _column_aliases("COLUMN_COUNTRY"))
+    if not country or country.lower() == "null":
+        country = (row.get("seller region") or "").strip()
+    return build_organization_locations(city, state, country)
+
+
+def _apollo_name_fallback_enabled() -> bool:
+    v = CONFIG.get("APOLLO_SEARCH_BY_NAME_FALLBACK", False)
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off", "none", ""):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return False
+
+
 def _process_stage5_seller(_key: str, rep_row: dict) -> Tuple[str, str, str, str, str]:
     raw_name = (rep_row.get("Scraped Seller Name") or rep_row.get("Seller") or "").strip()
     clean_name = seller_sp.extract_clean_company_name(raw_name)
@@ -782,13 +823,17 @@ def _process_stage5_seller(_key: str, rep_row: dict) -> Tuple[str, str, str, str
         clean_name = re.sub(r"\s+", " ", html.unescape(raw_name)).strip()
 
     domain = seller_sp.extract_company_domain_from_email(rep_row.get("seller email") or "")
+    locations = _build_stage5_locations(rep_row)
     stage4_person = (rep_row.get("seller incharge person") or "").strip()
     matched_email = matched_title = outreach_name = outreach_title = outreach_email = "null"
 
-    if not domain:
+    company_name = clean_name or raw_name
+    if not domain and not _apollo_name_fallback_enabled():
+        return matched_email, matched_title, outreach_name, outreach_title, outreach_email
+    if not domain and not company_name:
         return matched_email, matched_title, outreach_name, outreach_title, outreach_email
 
-    org = seller_sp.apollo_search_company(domain, clean_name or raw_name)
+    org = seller_sp.apollo_search_company(domain, company_name, locations)
     if not org or not isinstance(org, dict) or not org.get("id"):
         return matched_email, matched_title, outreach_name, outreach_title, outreach_email
 

@@ -46,7 +46,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import requests
@@ -367,29 +367,24 @@ def apollo_post(path, json_body=None, params=None):
     return None
 
 
-def apollo_search_company(domain, company_name: str):
-    """
-    Return first organization payload for next step:
-    - normal case: {"id": "<org_id>", ...}
-    - fallback case when organizations empty but accounts has organization_id:
-      returns {"id": "<organization_id from account>", "_from_account": True}
-    """
-    path = "/mixed_companies/search"
-    if domain:
-        data = apollo_post(path, json_body={"q_organization_domains_list": [domain]})
-    elif CONFIG.get("APOLLO_SEARCH_BY_NAME_FALLBACK", False):
-        qn = (company_name or "").strip()
-        if not qn:
-            return None
-        data = apollo_post(path, json_body={"q_organization_name": qn})
-    else:
-        return None
-    if not data:
+def _config_bool(key: str, default: bool = False) -> bool:
+    v = CONFIG.get(key, default)
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off", "none", ""):
+        return False
+    if s in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
+def _first_apollo_org(data: Optional[dict]) -> Optional[dict]:
+    if not data or not isinstance(data, dict):
         return None
     orgs = data.get("organizations") or []
     if orgs:
         return orgs[0]
-    # Fallback: some responses return accounts with organization_id but empty organizations.
     accounts = data.get("accounts") or []
     if accounts:
         first = accounts[0] if isinstance(accounts[0], dict) else {}
@@ -397,6 +392,79 @@ def apollo_search_company(domain, company_name: str):
         if oid:
             return {"id": oid, "_from_account": True}
     return None
+
+
+def _apollo_search_by_domain(domain: str) -> Optional[dict]:
+    data = apollo_post(
+        "/mixed_companies/search",
+        json_body={"q_organization_domains_list": [domain]},
+    )
+    org = _first_apollo_org(data)
+    if org:
+        print(f"      Domain search: {domain} → found org {org.get('id', '')}")
+    else:
+        print(f"      Domain search: {domain} → 0 results")
+    return org
+
+
+def _apollo_search_by_name(company_name: str, locations: Optional[List[str]] = None) -> Optional[dict]:
+    qn = (company_name or "").strip()
+    if not qn:
+        return None
+    body: Dict[str, Any] = {"q_organization_name": qn, "per_page": 10}
+    locs = [x for x in (locations or []) if x and str(x).strip()]
+    if locs:
+        body["organization_locations"] = locs
+        print(f"      Name+location search: {qn} | locations={locs}")
+    else:
+        print(f"      Name-only search: {qn} (no location columns)")
+    data = apollo_post("/mixed_companies/search", json_body=body)
+    org = _first_apollo_org(data)
+    if org:
+        tier = "name+location" if locs else "name-only"
+        print(f"      {tier} search → found org {org.get('id', '')}")
+    else:
+        tier = "name+location" if locs else "name-only"
+        print(f"      {tier} search → 0 results")
+    return org
+
+
+def apollo_search_company(
+    domain: Optional[str],
+    company_name: str,
+    locations: Optional[List[str]] = None,
+) -> Optional[dict]:
+    """
+    Return first organization payload for next step:
+    - normal case: {"id": "<org_id>", ...}
+    - fallback case when organizations empty but accounts has organization_id:
+      returns {"id": "<organization_id from account>", "_from_account": True}
+    Tiered search: domain → name+location → name-only (when APOLLO_SEARCH_BY_NAME_FALLBACK).
+    """
+    name_fallback = _config_bool("APOLLO_SEARCH_BY_NAME_FALLBACK")
+    qn = (company_name or "").strip()
+    locs = [x for x in (locations or []) if x and str(x).strip()]
+
+    if domain:
+        org = _apollo_search_by_domain(domain)
+        if org:
+            return org
+        if not name_fallback:
+            return None
+        if not qn:
+            return None
+        print("      Domain miss; trying name fallback")
+        if locs:
+            return _apollo_search_by_name(qn, locs)
+        return _apollo_search_by_name(qn, None)
+
+    if not name_fallback:
+        return None
+    if not qn:
+        return None
+    if locs:
+        return _apollo_search_by_name(qn, locs)
+    return _apollo_search_by_name(qn, None)
 
 
 def apollo_list_people(org_id: str):
@@ -1147,8 +1215,11 @@ def stage5():
             else:
                 apollo_name = apollo_title = apollo_email = "null"
 
-                if not domain:
+                if not domain and not _config_bool("APOLLO_SEARCH_BY_NAME_FALLBACK"):
                     print("   ⏭️  Skip: no usable company domain (name-search disabled)")
+                    skipped += 1
+                elif not domain and not (clean_name or raw_name):
+                    print("   ⏭️  Skip: no domain and no company name")
                     skipped += 1
                 else:
                     org = apollo_search_company(domain, clean_name or raw_name)

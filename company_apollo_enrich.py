@@ -15,6 +15,10 @@ Flow (same as amazon_seller_pipeline Stage 5):
   Org search tiers: domain → name+HQ location (city/state) → name-only (when fallback enabled).
 
 Parallel: one Apollo+GPT chain per unique company (domain or name); 4 workers by default.
+
+Resume: when APOLLOCOMPANY_SKIP_EXISTING=true (default), rows already in the output CSV are
+skipped (matched by company name + website domain + email). Output order does not need to match
+input order. New rows are appended. Set SKIP_EXISTING=false to re-run everything.
 """
 
 import csv
@@ -653,24 +657,26 @@ def enrich_company(
     return null_str(name), null_str(title), null_str(email), phone, person_id
 
 
-def row_identity_key(row: Dict[str, str]) -> Tuple[str, str, str]:
-    name = pick_column(row, normalize_column_aliases("COLUMN_COMPANY_NAME")).lower()
-    web = pick_column(row, normalize_column_aliases("COLUMN_WEBSITE")).lower()
-    em = pick_column(row, normalize_column_aliases("COLUMN_EMAIL")).lower()
-    return name, web, em
+def row_identity_key(row: Dict[str, str]) -> str:
+    """Stable key for resume matching; output rows may be unordered vs input."""
+    name = pick_column(row, normalize_column_aliases("COLUMN_COMPANY_NAME"))
+    name = re.sub(r"\s+", " ", html.unescape(name)).strip().lower()
+    web_raw = pick_column(row, normalize_column_aliases("COLUMN_WEBSITE"))
+    domain = extract_domain_from_website(web_raw)
+    web = domain if domain else web_raw.strip().lower().rstrip("/")
+    em = pick_column(row, normalize_column_aliases("COLUMN_EMAIL")).strip().lower()
+    return f"{name}|{web}|{em}"
 
 
 def load_done_row_keys(path: Path) -> set:
-    """Input rows already enriched (person email set and not null)."""
+    """Input rows already present in output (any enrichment result, including null contacts)."""
     done = set()
     if not path.is_file():
         return done
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            em = (row.get("person email") or "").strip().lower()
-            if em and em != "null":
-                done.add(row_identity_key(row))
+            done.add(row_identity_key(row))
     return done
 
 
@@ -816,9 +822,17 @@ def run():
     for idx, row in enumerate(all_rows, 1):
         if skip_existing and row_identity_key(row) in done_row_keys:
             skipped_resume += 1
-            print(f"\n[row {idx}] skipped (already in output)")
             continue
         pending.append((idx, row, build_row_context(row)))
+
+    if skipped_resume:
+        print(f"   Resume: skipped {skipped_resume} row(s) already in output")
+
+    if not pending:
+        print("\nAll input rows are already in the output file. Nothing to do.")
+        return
+
+    print(f"   Pending: {len(pending)} row(s) to enrich")
 
     company_reps: Dict[str, Dict[str, Any]] = {}
     row_keys: List[str] = []
