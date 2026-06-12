@@ -184,3 +184,4 @@ cython_debug/
 # Defined by User
 *.csv
 *.json
+nds_hospital_groups_enrich.py

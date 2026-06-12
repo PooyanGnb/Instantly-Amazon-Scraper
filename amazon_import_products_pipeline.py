@@ -1258,8 +1258,25 @@ STAGES = {
     5: stage5,
 }
 
+LAST_STAGE = max(STAGES)
 
-def main(only_stage: Optional[int] = None):
+
+def resolve_stages_to_run(
+    only_stage: Optional[int] = None,
+    exclude_from_stage: Optional[int] = None,
+) -> List[int]:
+    if only_stage is not None:
+        return [only_stage]
+    if exclude_from_stage is not None:
+        return list(range(1, exclude_from_stage))
+    return list(range(1, LAST_STAGE + 1))
+
+
+def main(
+    only_stage: Optional[int] = None,
+    exclude_from_stage: Optional[int] = None,
+):
+    stages_to_run = resolve_stages_to_run(only_stage, exclude_from_stage)
     start = time.time()
     print("\n" + "=" * 90)
     print("AMAZON IMPORT PRODUCTS PIPELINE (5 STAGES)")
@@ -1268,12 +1285,11 @@ def main(only_stage: Optional[int] = None):
     print(f"📁 S1 sellers:{CONFIG['STAGE1_SELLERS_OUTPUT_CSV']}")
     print(f"📁 S1 resell: {CONFIG['STAGE1_RESELLERS_OUTPUT_CSV']}")
     print(f"📁 S5 final:  {CONFIG['STAGE5_OUTPUT_CSV']}")
+    if exclude_from_stage is not None:
+        print(f"▶️  Running stages: {stages_to_run} (excluding {exclude_from_stage}–{LAST_STAGE})")
 
-    if only_stage is not None:
-        STAGES[only_stage]()
-    else:
-        for n in range(1, 6):
-            STAGES[n]()
+    for n in stages_to_run:
+        STAGES[n]()
 
     elapsed = time.time() - start
     print("\n" + "=" * 90)
@@ -1288,19 +1304,31 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Amazon Import Products Pipeline")
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4, 5], help="Run a single stage only")
+    parser.add_argument(
+        "--exclude-from-stage",
+        type=int,
+        choices=[2, 3, 4, 5, 6],
+        metavar="N",
+        help="Run stages 1 through N-1, skipping N and later (e.g. 5 runs stages 1-4)",
+    )
     args = parser.parse_args()
+    if args.stage is not None and args.exclude_from_stage is not None:
+        parser.error("Cannot use --stage together with --exclude-from-stage")
+
+    stages_to_run = resolve_stages_to_run(args.stage, args.exclude_from_stage)
 
     API_KEY = (os.getenv("API_KEY") or "").strip()
-    if not API_KEY:
+    if not API_KEY and any(n >= 2 for n in stages_to_run):
         raise ValueError("API_KEY not found in .env file.")
     OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not OPENAI_API_KEY:
+    if not OPENAI_API_KEY and any(n >= 4 for n in stages_to_run):
         raise ValueError("OPENAI_API_KEY not found in .env file.")
     APOLLO_API_KEY = (os.getenv("APOLLO_API_KEY") or "").strip()
-    if not APOLLO_API_KEY:
+    if not APOLLO_API_KEY and 5 in stages_to_run:
         raise ValueError("APOLLO_API_KEY not found in .env file.")
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    if OPENAI_API_KEY:
+        client = OpenAI(api_key=OPENAI_API_KEY)
     seller_sp.load_public_email_domains()
 
-    main(only_stage=args.stage)
+    main(only_stage=args.stage, exclude_from_stage=args.exclude_from_stage)
